@@ -1,0 +1,1388 @@
+{% extends "base.html" %}
+{% block title %}Diagnostiek · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="diag-layout dash-layout">
+
+  <div class="dash-head">
+    <h1 class="dash-title">Diagnostiek{% if selected_period_label %} <span class="dash-title-period">· {{ selected_period_label }}</span>{% endif %}</h1>
+    <form method="get" class="dash-filters">
+      <div class="dash-filter">
+        <label>{% if selected_range and selected_range != '1m' %}Eindigend in maand{% else %}Maand{% endif %}</label>
+        <select name="month" onchange="this.form.querySelector('[name=salary_period]').value=''; this.form.submit()">
+          {% for m in months %}
+            <option value="{{ m.value }}" {% if m.value == selected_month and not selected_salary_period %}selected{% endif %}>{{ m.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="dash-filter">
+        <label>Bereik</label>
+        <select name="range" onchange="this.form.querySelector('[name=salary_period]').value=''; this.form.submit()">
+          {% for r in range_options %}
+            <option value="{{ r.value }}" {% if r.value == selected_range and not selected_salary_period %}selected{% endif %}>{{ r.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="dash-filter">
+        <label>Salarisperiode</label>
+        <select name="salary_period" onchange="this.form.submit()" {% if not salary_periods %}disabled title="Categoriseer een transactie als Salaris om salarisperiodes te activeren"{% endif %}>
+          <option value="">— Gebruik maand/bereik —</option>
+          {% for p in salary_periods %}
+            <option value="{{ p.start }}" {% if p.start == selected_salary_period %}selected{% endif %}>{{ p.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </form>
+  </div>
+
+  {% if not data %}
+    <p class="muted">Nog geen transacties — upload een CSV om diagnostiek te zien.</p>
+  {% else %}
+
+  {# KPI STRIP — Net | Income | Expenses | Savings rate #}
+  <div id="sec-overview" class="dash-kpis">
+    <div class="dash-kpi dash-kpi-net">
+      <div class="dash-kpi-label">
+        Netto
+        {% if data.period_mode == 'salary' %}deze salarisperiode
+        {% elif data.period_mode == 'range' %}over {{ data.period_label.split(' · ')[0] | lower }}
+        {% else %}deze maand{% endif %}
+      </div>
+      <div class="dash-kpi-value {% if data.net >= 0 %}pos{% else %}neg{% endif %}">{{ data.net | eur }}</div>
+      <svg id="heroSpark" class="dash-kpi-spark" aria-hidden="true"></svg>
+    </div>
+    <div class="dash-kpi">
+      <div class="dash-kpi-label">Inkomsten</div>
+      <div class="dash-kpi-value pos">{{ data.income | eur }}</div>
+      <div class="dash-kpi-meta">
+        {% if data.tx_count %}{{ data.tx_count }} transacties{% endif %}
+      </div>
+    </div>
+    <div class="dash-kpi">
+      <div class="dash-kpi-label">Uitgaven</div>
+      <div class="dash-kpi-value neg">{{ data.expenses | eur }}</div>
+      <div class="dash-kpi-meta">
+        {{ data.daily_burn | eur }}/dag
+        {% if data.is_current_month and data.period_mode == 'month' and data.projected_spend is not none %}
+          · {{ data.projected_spend | eur }} verwacht
+        {% endif %}
+      </div>
+    </div>
+    <div class="dash-kpi"
+         {% if data.savings_rate_salary is not none and data.savings_rate_all is not none %}
+           title="Alleen salaris als basis. Op basis van alle bijschrijvingen (incl. terugbetalingen, giften): {{ '{:.0f}%'.format(data.savings_rate_all * 100) }}"
+         {% elif data.savings_rate_salary is none and data.savings_rate_all is not none %}
+           title="Op basis van alle bijschrijvingen — markeer je salaris met de categorie 'Salaris' voor een eerlijker spaarquote."
+         {% endif %}>
+      <div class="dash-kpi-label">
+        Spaarquote
+        {% if data.savings_rate_salary is not none %}
+          <span class="muted">· van salaris</span>
+        {% elif data.savings_rate_all is not none %}
+          <span class="muted">· van alle bijschrijvingen</span>
+        {% endif %}
+      </div>
+      <div class="dash-kpi-value {% if data.savings_rate is none %}muted{% elif data.savings_rate >= 0 %}pos{% else %}neg{% endif %}">
+        {% if data.savings_rate is none %}—{% else %}{{ '{:.0f}%'.format(data.savings_rate * 100) }}{% endif %}
+      </div>
+      <div class="dash-kpi-meta">
+        {% if data.is_current_month and data.period_mode == 'month' %}
+          Dag {{ data.days_elapsed }} van {{ data.days_in_month }}
+        {% elif data.window_days %}
+          over {{ data.window_days }} dagen
+        {% endif %}
+        {% if data.uncat_count %}· {{ data.uncat_count }} ongecategoriseerd{% endif %}
+      </div>
+    </div>
+  </div>
+
+  {# AI · DIGEST · FORECAST · ADVICE — three cards, one generate button #}
+  {% set _cached_modes = [] %}
+  {% if cached_digest %}{% set _ = _cached_modes.append('digest') %}{% endif %}
+  {% if cached_forecast %}{% set _ = _cached_modes.append('forecast') %}{% endif %}
+  {% if cached_advice %}{% set _ = _cached_modes.append('advice') %}{% endif %}
+  <div id="sec-ai-row"
+       class="ai-row"
+       data-uncat-count="{{ data.uncat_count or 0 }}"
+       data-cached-modes="{{ _cached_modes | join(',') }}"
+       data-auto-generate="{{ '1' if auto_generate_ai else '0' }}"
+       data-active-goal="{{ active_goal.id }}">
+    <div class="ai-row-header">
+      <span class="ai-row-title" data-tooltip="Eén Gemini API-sleutel, drie invalshoeken. Samenvatting blikt terug op de periode, Prognose voorspelt waar het heen gaat, Advies wijst op de meest impactvolle verandering voor je gekozen doel.">AI-inzichten · {{ data.period_label }}</span>
+      <button type="button" id="aiGenerateAll" class="dash-panel-btn">
+        {% if _cached_modes %}Opnieuw genereren{% else %}Genereren{% endif %}
+      </button>
+    </div>
+    <div class="dash-grid ai-card-grid">
+      {% set _modes = [
+        ('digest',   'Samenvatting',   'Wat er deze periode is gebeurd.',
+         'Gewone prozasamenvatting van inkomsten, uitgaven en opvallende onderwerpen in deze periode.'),
+        ('forecast', 'Prognose', 'Waar het naartoe gaat.',
+         'Beschrijvende prognose — eindzone, ontwikkeling spaarquote, ruimte t.o.v. terugkerende lasten.'),
+        ('advice',   'Advies',   'Meest impactvolle verandering om door te voeren.',
+         'Eén gekwantificeerde aanbeveling, gericht op je actieve doel.'),
+      ] %}
+      {% for mode_id, mode_label, mode_sub, mode_tip in _modes %}
+        {% set _cache = ({'digest': cached_digest, 'forecast': cached_forecast, 'advice': cached_advice})[mode_id] %}
+        <section id="sec-ai-{{ mode_id }}" class="dash-panel dash-panel-1-3 ai-card" data-mode="{{ mode_id }}">
+          <div class="dash-panel-title">
+            <span data-tooltip="{{ mode_tip }}">{{ mode_label }}{% if mode_id == 'advice' %} · {{ active_goal.title }}{% endif %}</span>
+            <button type="button" class="dash-panel-btn ai-card-regen" data-mode="{{ mode_id }}" title="Alleen {{ mode_label }} opnieuw genereren" aria-label="{{ mode_label }} opnieuw genereren">↻</button>
+          </div>
+          <div class="ai-summary-body ai-card-body">
+            {% if _cache %}
+              <p class="ai-summary-text">{{ _cache.summary }}</p>
+              <p class="ai-summary-meta">
+                <span>Gegenereerd {{ _cache.created_at | replace('T', ' ') }} UTC</span>
+                {% if _cache.model %}<span>· {{ _cache.model }}</span>{% endif %}
+                {% if _cache.stale %}
+                  <span class="ai-summary-stale">· transacties gewijzigd — genereer opnieuw om te verversen</span>
+                {% endif %}
+              </p>
+            {% else %}
+              <p class="muted ai-summary-hint">{{ mode_sub }}{% if mode_id == 'digest' %} Gebruikt de API-sleutel op je <a href="{{ url_for('profile') }}">Profiel</a> — blijft in je browser.{% endif %}</p>
+            {% endif %}
+          </div>
+        </section>
+      {% endfor %}
+    </div>
+  </div>
+
+  {# TRAJECTORY  #}
+  <div class="dash-grid">
+    <section id="sec-trajectory" class="dash-panel">
+      <div class="dash-panel-title">
+        <span data-tooltip="Dagelijks rekeningsaldo over het gekozen tijdvak. Onderschrift toont de dag met het laagste saldo en eventuele salarisstortingen.">Verloop · saldo over de periode</span>
+        {% if data.balance_trajectory.accounts and data.balance_trajectory.accounts|length > 1 %}
+          <form method="get" class="dash-panel-control">
+            {% if selected_month %}<input type="hidden" name="month" value="{{ selected_month }}">{% endif %}
+            {% if selected_range %}<input type="hidden" name="range" value="{{ selected_range }}">{% endif %}
+            {% if selected_salary_period %}<input type="hidden" name="salary_period" value="{{ selected_salary_period }}">{% endif %}
+            <select name="balance_account" onchange="this.form.submit()">
+              {% for a in data.balance_trajectory.accounts %}
+                <option value="{{ a }}" {% if a == data.balance_trajectory.account %}selected{% endif %}>{{ a }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        {% endif %}
+      </div>
+      {% if data.balance_trajectory.points %}
+        <div class="chart-canvas chart-canvas-tall"><canvas id="balanceChart"></canvas></div>
+        {% if data.balance_trajectory.lowest %}
+          <p class="dash-panel-caption">
+            Laagste {{ data.balance_trajectory.lowest.balance | eur }} op {{ data.balance_trajectory.lowest.date }}
+            {% if data.balance_trajectory.salary_dates %}
+              · salaris {{ data.balance_trajectory.salary_dates | join(', ') }}
+            {% endif %}
+          </p>
+        {% endif %}
+      {% else %}
+        <p class="muted">Geen saldo-gegevens in dit tijdvak{% if data.balance_trajectory.account %} voor {{ data.balance_trajectory.account }}{% endif %}.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  {# 12-MONTH TREND #}
+  <div class="dash-grid">
+    <section id="sec-context" class="dash-panel">
+      <div class="dash-panel-title"><span data-tooltip="Twaalfmaandstrend van inkomsten, uitgaven en netto. Daaronder: vergelijking per categorie t.o.v. dezelfde maand vorig jaar (vereist ≥13 maanden geschiedenis).">In context · laatste 12 maanden</span></div>
+      <div class="chart-canvas chart-canvas-tall"><canvas id="trendChart"></canvas></div>
+      {% if data.yoy %}
+        <h3 class="dash-subhead">Jaar op jaar · {{ data.yoy.current_month }} vs {{ data.yoy.prior_year_month }}</h3>
+        {% if data.yoy.inflation_flags %}
+          <ul class="endnote-list">
+            {% for f in data.yoy.inflation_flags %}
+              <li class="endnote endnote-warning">
+                <span class="endnote-marker" style="background: {{ f.color }};"></span>
+                <span class="endnote-text">
+                  <span class="endnote-title">{{ f.name }} gestegen met {{ '{:.0f}%'.format(f.delta_pct) }}</span>
+                  <span class="endnote-detail">{{ f.current | eur }} vs {{ f.prior | eur }} een jaar geleden</span>
+                </span>
+              </li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+        {% set ns = namespace(mx=0) %}
+        {% for r in data.yoy.rows %}
+          {% if r.current and r.current > ns.mx %}{% set ns.mx = r.current %}{% endif %}
+          {% if r.prior and r.prior > ns.mx %}{% set ns.mx = r.prior %}{% endif %}
+        {% endfor %}
+        <div class="diag-bars" role="list">
+          <div class="diag-bars-head">
+            <span>Categorie</span>
+            <span>Deze maand vs vorig jaar</span>
+            <span class="num">Deze maand</span>
+            <span class="num">Δ</span>
+          </div>
+          {% for r in data.yoy.rows %}
+            {% set cur_w = (r.current / ns.mx * 100) if ns.mx > 0 and r.current else 0 %}
+            {% set prior_w = (r.prior / ns.mx * 100) if ns.mx > 0 and r.prior else 0 %}
+            <div class="diag-bar-row" role="listitem">
+              <div class="bar-label"><span class="swatch" style="background: {{ r.color }};"></span>{{ r.name }}</div>
+              <div class="bar-track" title="{{ r.current | eur }} deze maand · {{ r.prior | eur }} een jaar geleden">
+                <div class="bar-fill" style="width: {{ '{:.2f}'.format(cur_w) }}%; background: {{ r.color }};"></div>
+                {% if prior_w > 0 %}
+                  <div class="bar-tick" style="left: {{ '{:.2f}'.format(prior_w) }}%;"></div>
+                {% endif %}
+              </div>
+              <div class="bar-current num">{{ r.current | eur }}</div>
+              <div class="bar-delta num {% if r.delta_pct is none %}muted{% elif r.delta_pct > 0 %}delta-up{% elif r.delta_pct < 0 %}delta-down{% endif %}">
+                {% if r.delta_pct is none %}nieuw{% else %}{% if r.delta_pct > 0 %}+{% endif %}{{ '{:.0f}%'.format(r.delta_pct) }}{% endif %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+  </div>
+
+  {# WHERE · pie + bar-rows #}
+  <div id="sec-where" class="dash-grid">
+    <section class="dash-panel dash-panel-1-3">
+      <div class="dash-panel-title"><span data-tooltip="Aandeel van de totale uitgaven per onderwerp in deze periode. Klik op een segment om in te zoomen op de categorieën. Sparen en andere uitgesloten onderwerpen worden niet meegerekend.">Waar het naartoe ging · <span id="pieTitle">per onderwerp</span></span></div>
+      {% if data.pie %}
+        <div class="chart-canvas chart-canvas-pie pie-host">
+          <canvas id="pieChart"></canvas>
+          <div class="pie-center">
+            <div class="pie-total-label">Totaal</div>
+            <div id="pieTotal" class="pie-total"></div>
+            <button type="button" id="pieBack" class="pie-back" hidden>← Alle onderwerpen</button>
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">Geen uitgaven in deze periode.</p>
+      {% endif %}
+    </section>
+    <section class="dash-panel dash-panel-2-3">
+      <div class="dash-panel-title">
+        <span data-tooltip="Uitgaven per categorie in deze periode vs het vorige vergelijkbare tijdvak. Het streepje op elke balk markeert het vorige bedrag; Δ is de procentuele verandering.">Per categorie</span>
+        <span class="dash-panel-sub">
+          vs {% if data.period_mode == 'salary' %}vorige periode
+          {% elif data.period_mode == 'range' %}vorige {{ data.period_label.split(' · ')[0] | lower }}
+          {% else %}{{ data.mom_prior_label | lower }}{% endif %}
+        </span>
+      </div>
+      {% if data.mom %}
+        {% set mns = namespace(mx=0) %}
+        {% for r in data.mom %}
+          {% if r.current and r.current > mns.mx %}{% set mns.mx = r.current %}{% endif %}
+          {% if r.prior_avg and r.prior_avg > mns.mx %}{% set mns.mx = r.prior_avg %}{% endif %}
+        {% endfor %}
+        <div class="diag-bars" role="list">
+          <div class="diag-bars-head">
+            <span>Categorie</span>
+            <span></span>
+            <span class="num">Besteed</span>
+            <span class="num">Δ</span>
+          </div>
+          {% for r in data.mom %}
+            {% set cur_w = (r.current / mns.mx * 100) if mns.mx > 0 and r.current else 0 %}
+            {% set prior_w = (r.prior_avg / mns.mx * 100) if mns.mx > 0 and r.prior_avg else 0 %}
+            <div class="diag-bar-row" role="listitem">
+              <div class="bar-label"><span class="swatch" style="background: {{ r.color }};"></span>{{ r.name }}</div>
+              <div class="bar-track" title="{{ r.current | eur }} deze periode · {{ r.prior_avg | eur }} vorige">
+                <div class="bar-fill" style="width: {{ '{:.2f}'.format(cur_w) }}%; background: {{ r.color }};"></div>
+                {% if prior_w > 0 %}
+                  <div class="bar-tick" style="left: {{ '{:.2f}'.format(prior_w) }}%;"></div>
+                {% endif %}
+              </div>
+              <div class="bar-current num">{{ r.current | eur }}</div>
+              <div class="bar-delta num {% if r.delta_pct is none %}muted{% elif r.delta_pct > 0 %}delta-up{% elif r.delta_pct < 0 %}delta-down{% endif %}">
+                {% if r.delta_pct is none %}nieuw{% else %}{% if r.delta_pct > 0 %}+{% endif %}{{ '{:.0f}%'.format(r.delta_pct) }}{% endif %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="muted">Nog niet genoeg geschiedenis.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  {# TOPIC-LEVEL INSIGHTS · concentration, subscription bloat, categorization health #}
+  <div class="dash-grid">
+    <section class="dash-panel dash-panel-1-3">
+      <div class="dash-panel-title"><span data-tooltip="Herfindahl-Hirschman-achtige concentratie over onderwerpen. Hoog = uitgaven worden gedomineerd door één onderwerp; goed verdeeld = ongeveer gelijk verdeeld over onderwerpen.">Onderwerpconcentratie</span></div>
+      {% if data.topic_concentration %}
+        <div class="composition-headline">
+          <span>{{ '{:.0f}%'.format(data.topic_concentration.top_share * 100) }}</span>
+          <span class="muted small">in <strong style="color: {{ data.topic_concentration.top_color }};">{{ data.topic_concentration.top_topic }}</strong></span>
+        </div>
+        <p class="dash-callout-text muted small">
+          Verdeeld over {{ data.topic_concentration.topic_count }} onderwerpen · {{ data.topic_concentration.label }} (HHI {{ '{:.0f}'.format(data.topic_concentration.hhi) }})
+        </p>
+      {% else %}
+        <p class="muted">Niet genoeg uitgaven om te meten.</p>
+      {% endif %}
+    </section>
+
+    <section class="dash-panel dash-panel-1-3">
+      <div class="dash-panel-title"><span data-tooltip="Kwaliteit van categorisering. Ongecategoriseerde transacties verschijnen niet in onderwerpuitsplitsingen — houd dit laag zodat de rest van de diagnostiek betekenisvol blijft.">Kwaliteit categorisering</span></div>
+      <div class="composition-headline">
+        <span class="{% if data.uncat_pct > 20 %}neg-amt{% elif data.uncat_pct > 5 %}warn-amt{% else %}pos-amt{% endif %}">{{ '{:.0f}%'.format(data.uncat_pct) }}</span>
+        <span class="muted small">ongecategoriseerd</span>
+      </div>
+      <p class="dash-callout-text muted small">
+        {{ data.uncat_count }} van {{ data.tx_count }} transactie{% if data.tx_count != 1 %}s{% endif %} deze periode
+      </p>
+    </section>
+
+    <section class="dash-panel dash-panel-1-3">
+      <div class="dash-panel-title"><span data-tooltip="Aandachtslijst voor vaste-lasten-onderwerpen (bijv. Abonnementen). Signaleert groei t.o.v. de basis over 6 maanden, dominantie van één categorie en nieuw toegevoegde categorieën.">Abonnementsgroei</span></div>
+      {% if data.subscription_bloat %}
+        <ul class="endnote-list endnote-list-compact">
+          {% for c in data.subscription_bloat.callouts %}
+            <li class="endnote endnote-{{ c.severity }}">
+              <span class="endnote-marker" style="background: {{ c.color }};"></span>
+              <span class="endnote-text">
+                <span class="endnote-title">{{ c.title }}</span>
+                <span class="endnote-detail">{{ c.detail }}</span>
+              </span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">Geen vaste-lasten-onderwerp gesignaleerd deze periode.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  {# TOPIC TRENDS · multi-line chart, trailing 12 months #}
+  {% if data.topic_trends and data.topic_trends.series %}
+  <div class="dash-grid">
+    <section class="dash-panel">
+      <div class="dash-panel-title"><span data-tooltip="Uitgaven per onderwerp over de laatste 12 maanden. Klik op een legenda-item om een onderwerp te verbergen.">Trends per onderwerp · laatste 12 maanden</span></div>
+      <div class="chart-canvas chart-canvas-short"><canvas id="topicTrendsChart"></canvas></div>
+    </section>
+  </div>
+  {% endif %}
+
+  {# TOP MERCHANTS #}
+  {% if data.top_merchants %}
+  <div class="dash-grid">
+    <section class="dash-panel">
+      <div class="dash-panel-title"><span data-tooltip="Tegenpartijen waar je deze periode het meeste mee hebt uitgegeven, gerangschikt op totaalbedrag. Exclusief Sparen/Overschrijvingen en alle uitgesloten categorieën.">Top winkels</span></div>
+      <table class="data-table top-merchants-table">
+        <thead>
+          <tr>
+            <th>Winkel</th>
+            <th>Categorie</th>
+            <th class="num">Transacties</th>
+            <th class="num">Besteed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in data.top_merchants %}
+            <tr>
+              <td>{{ m.name }}</td>
+              <td>
+                {% if m.category_name %}
+                  <span class="swatch" style="background: {{ m.category_color }};"></span>{{ m.category_name }}
+                {% else %}
+                  <span class="muted">—</span>
+                {% endif %}
+              </td>
+              <td class="num muted">{{ m.count }}</td>
+              <td class="num">{{ m.amount | eur }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+  {% endif %}
+
+  {# WHEN · heatmap full + day-of-week split #}
+  <div id="sec-when" class="dash-grid">
+    <section class="dash-panel">
+      <div class="dash-panel-title">
+        <span data-tooltip="Kalender-heatmap van dagelijkse afschrijvingstotalen. Donkerdere vlakken = dagen met meer uitgaven. Kleurbanden op basis van absoluut bedrag: €0 · €0–10 · €10–25 · €25–50 · €50–100 · €100+. Gebruikt het gekozen tijdvak als dit minstens 3 maanden lang is; anders een rollend jaar.">Wanneer · {% if data.heatmap.scope == 'period' %}gekozen tijdvak{% else %}afgelopen jaar{% endif %}</span>
+      </div>
+      <div id="heatmapHost" class="heatmap-host" data-heatmap='{{ data.heatmap | tojson }}'></div>
+    </section>
+  </div>
+  <div class="dash-grid">
+    <section class="dash-panel dash-panel-2-3">
+      <div class="dash-panel-title">
+        <span data-tooltip="Gemiddelde dagelijkse uitgaven gegroepeerd per weekdag. Elke balk = totaal afschrijvingen op die weekdag ÷ aantal van die weekdagen in het tijdvak. Gebruikt het gekozen tijdvak als ≥3 maanden lang; anders laatste 90 dagen.">Per weekdag · {% if data.dow.scope == 'period' %}gekozen tijdvak ({{ data.dow.span_days }}d){% else %}laatste 90 dagen{% endif %}</span>
+      </div>
+      <div class="chart-canvas chart-canvas-short"><canvas id="dowChart"></canvas></div>
+    </section>
+    <section class="dash-panel dash-panel-1-3">
+      <div class="dash-panel-title"><span data-tooltip="De weekdag met de hoogste gemiddelde dagelijkse uitgaven, en hoe vaak dat je algemene dagelijkse gemiddelde is. Gevoelig voor eenmalige grote transacties in korte tijdvakken.">Piekdag</span></div>
+      {% if data.dow.peak and data.dow.overall_avg > 0 and data.dow.peak.average > 0 %}
+        <div class="dash-callout-value">{{ '{:.1f}×'.format(data.dow.peak.average / data.dow.overall_avg) }}</div>
+        <p class="dash-callout-text">
+          op <strong>{{ data.dow.peak.label }}-dagen</strong> ({{ data.dow.peak.average | eur }}/dag)
+          vs een gemiddelde dag ({{ data.dow.overall_avg | eur }}/dag).
+        </p>
+      {% else %}
+        <p class="muted">Niet genoeg dagdata.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  {# COMPOSITION · fixed/var + income split #}
+  <div id="sec-composition" class="dash-grid">
+    <section class="dash-panel dash-panel-half">
+      <div class="dash-panel-title"><span data-tooltip="Splitst de uitgaven van deze periode op in terugkerende vaste lasten (abonnementen, huur, verzekeringen) en daadwerkelijk vrije uitgaven. Het hoofdcijfer is wat echt variabel was.">Vast vs variabel</span></div>
+      {% if data.fixed_var.total > 0 %}
+        <div class="composition-headline">
+          <span class="pos-amt">{{ data.fixed_var.variable | eur }}</span>
+          <span class="muted small">echt vrij besteedbaar</span>
+        </div>
+        <div class="composition-bar">
+          <div class="composition-fill fixed-fill"
+               style="width: {{ '{:.1f}'.format(data.fixed_var.fixed_pct) }}%"
+               title="Vast: {{ data.fixed_var.fixed | eur }}"></div>
+        </div>
+        <div class="composition-legend small muted">
+          Vast {{ data.fixed_var.fixed | eur }} ({{ '{:.0f}%'.format(data.fixed_var.fixed_pct) }})
+          · Variabel {{ data.fixed_var.variable | eur }}
+        </div>
+        <div class="chart-canvas chart-canvas-short"><canvas id="fixedVarChart"></canvas></div>
+      {% else %}
+        <p class="muted">Geen uitgaven in deze periode.</p>
+      {% endif %}
+    </section>
+
+    <section class="dash-panel dash-panel-half">
+      <div class="dash-panel-title"><span data-tooltip="Samenstelling van alle bijschrijvingen in deze periode — salaris, terugbetalingen, overschrijvingen in, giften, enz. Handig om echte inkomsten te scheiden van eenmalige binnenkomsten.">Verdeling inkomsten</span></div>
+      {% if data.income_split.parts %}
+        <div class="composition-headline">
+          <span class="pos-amt">{{ data.income_split.total | eur }}</span>
+          <span class="muted small">totale bijschrijvingen</span>
+        </div>
+        <div class="composition-bar composition-bar-multi">
+          {% for p in data.income_split.parts %}
+            <div class="composition-fill"
+                 style="width: {{ '{:.2f}'.format(p.amount / data.income_split.total * 100) }}%; background: {{ p.color }};"
+                 title="{{ p.name }}: {{ p.amount | eur }}"></div>
+          {% endfor %}
+        </div>
+        <ul class="composition-list small">
+          {% for p in data.income_split.parts %}
+            <li>
+              <span class="swatch" style="background: {{ p.color }};"></span>
+              {{ p.name }}
+              <span class="muted">· {{ p.amount | eur }} ({{ '{:.0f}%'.format(p.amount / data.income_split.total * 100) }})</span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">Geen inkomsten in deze periode.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  {# CHANNEL MIX #}
+  <div class="dash-grid">
+    <section class="dash-panel">
+      <div class="dash-panel-title"><span data-tooltip="Hoe je uitgaven verdeeld zijn over betaalkanalen (pinpas, iDEAL, automatische incasso, overschrijving, enz.) per maand. Signaleert 'sluipende automatische incasso's' wanneer het aandeel automatische incasso's merkbaar stijgt over 3 maanden.">Kanaalverdeling · laatste 6 maanden</span></div>
+      {% if data.channel_mix.series %}
+        <div class="chart-canvas chart-canvas-short"><canvas id="channelChart"></canvas></div>
+        {% if data.channel_mix.autopay_creep %}
+          <p class="dash-panel-caption warning">
+            Aandeel automatische incasso's groeide van {{ '{:.0f}%'.format(data.channel_mix.autopay_creep.from_pct) }}
+            naar {{ '{:.0f}%'.format(data.channel_mix.autopay_creep.to_pct) }} in de laatste 3 maanden — sluipende automatische incasso's.
+          </p>
+        {% endif %}
+      {% else %}
+        <p class="muted">Nog niet genoeg kanaaldata.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  {# HEALTH (collapsible) #}
+  {% set coverage_pct = data.cat_quality.pct.auto + data.cat_quality.pct.rule + data.cat_quality.pct.manual %}
+  <div id="sec-health" class="dash-grid">
+    <section class="dash-panel">
+      <details class="dash-details">
+        <summary class="dash-details-summary">
+          <span class="dash-details-title">Gezondheid · datakwaliteit</span>
+          <span class="dash-details-peek">
+            {{ '{:.0f}%'.format(coverage_pct) }} gecategoriseerd
+            {% if data.cat_quality.acceptance_rate is not none %}
+              · {{ '{:.0f}%'.format(data.cat_quality.acceptance_rate) }} geaccepteerd
+            {% endif %}
+            · {{ data.cat_quality.stale_rules | length }} verouderde regel{% if data.cat_quality.stale_rules | length != 1 %}s{% endif %}
+          </span>
+          <span class="dash-details-chevron" aria-hidden="true">›</span>
+        </summary>
+        <div class="health-grid">
+          <div class="health-tile">
+            <div class="tile-label">Dekking</div>
+            <div class="composition-headline">
+              <span>{{ '{:.0f}%'.format(coverage_pct) }}</span>
+              <span class="muted small">van {{ data.cat_quality.total }}</span>
+            </div>
+            <div class="composition-bar composition-bar-multi">
+              {% if data.cat_quality.buckets.rule %}<div class="composition-fill" style="width: {{ '{:.2f}'.format(data.cat_quality.pct.rule) }}%; background: var(--cat-rule);" title="Regel"></div>{% endif %}
+              {% if data.cat_quality.buckets.auto %}<div class="composition-fill" style="width: {{ '{:.2f}'.format(data.cat_quality.pct.auto) }}%; background: var(--cat-auto);" title="Auto"></div>{% endif %}
+              {% if data.cat_quality.buckets.manual %}<div class="composition-fill" style="width: {{ '{:.2f}'.format(data.cat_quality.pct.manual) }}%; background: var(--cat-manual);" title="Handmatig"></div>{% endif %}
+              {% if data.cat_quality.buckets.uncategorized %}<div class="composition-fill" style="width: {{ '{:.2f}'.format(data.cat_quality.pct.uncategorized) }}%; background: var(--cat-uncat);" title="Ongecategoriseerd"></div>{% endif %}
+            </div>
+            <ul class="composition-list small muted">
+              <li><span class="swatch" style="background: var(--cat-rule);"></span>Regel {{ data.cat_quality.buckets.rule }} ({{ '{:.0f}%'.format(data.cat_quality.pct.rule) }})</li>
+              <li><span class="swatch" style="background: var(--cat-auto);"></span>Auto {{ data.cat_quality.buckets.auto }} ({{ '{:.0f}%'.format(data.cat_quality.pct.auto) }})</li>
+              <li><span class="swatch" style="background: var(--cat-manual);"></span>Handmatig {{ data.cat_quality.buckets.manual }} ({{ '{:.0f}%'.format(data.cat_quality.pct.manual) }})</li>
+              <li><span class="swatch" style="background: var(--cat-uncat);"></span>Ongecategoriseerd {{ data.cat_quality.buckets.uncategorized }} ({{ '{:.0f}%'.format(data.cat_quality.pct.uncategorized) }})</li>
+            </ul>
+          </div>
+
+          <div class="health-tile">
+            <div class="tile-label">Acceptatie van suggesties</div>
+            <div class="composition-headline">
+              {% if data.cat_quality.acceptance_rate is none %}
+                <span class="muted">—</span>
+                <span class="muted small">geen suggesties in deze periode</span>
+              {% else %}
+                <span>{{ '{:.0f}%'.format(data.cat_quality.acceptance_rate) }}</span>
+                <span class="muted small">{{ data.cat_quality.acceptance_accepted }} van {{ data.cat_quality.acceptance_presented }}</span>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="health-tile">
+            <div class="tile-label">Meest actieve regels</div>
+            {% if data.cat_quality.top_rules %}
+              <ul class="composition-list small">
+                {% for r in data.cat_quality.top_rules %}
+                  <li>
+                    <span class="swatch" style="background: {{ r.category_color or '#94a3b8' }};"></span>
+                    <strong>{{ r.pattern }}</strong>
+                    <span class="muted">→ {{ r.category_name }} · {{ r.hits }} treffer{% if r.hits != 1 %}s{% endif %}</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="muted small">Nog geen regels geactiveerd.</p>
+            {% endif %}
+          </div>
+
+          <div class="health-tile">
+            <div class="tile-label">Verouderde regels · 90+ dagen</div>
+            {% if data.cat_quality.stale_rules %}
+              <ul class="composition-list small">
+                {% for r in data.cat_quality.stale_rules %}
+                  <li>
+                    <span class="swatch" style="background: {{ r.category_color or '#94a3b8' }};"></span>
+                    <strong>{{ r.pattern }}</strong>
+                    <span class="muted">→ {{ r.category_name }}</span>
+                  </li>
+                {% endfor %}
+              </ul>
+              <p class="muted small"><a href="{{ url_for('rules') }}">Bekijk op Regels →</a></p>
+            {% else %}
+              <p class="muted small">Alle regels zijn recent geactiveerd.</p>
+            {% endif %}
+          </div>
+        </div>
+      </details>
+    </section>
+  </div>
+
+  {# WORTH NOTING (collapsible) #}
+  <div id="sec-notes" class="dash-grid">
+    <section class="dash-panel">
+      <details class="dash-details">
+        <summary class="dash-details-summary">
+          <span class="dash-details-title">Het vermelden waard</span>
+          <span class="dash-details-peek">
+            {% if data.anomalies %}
+              {{ data.anomalies | length }} item{% if data.anomalies | length != 1 %}s{% endif %} gemarkeerd
+            {% else %}
+              Niets gemarkeerd deze periode
+            {% endif %}
+          </span>
+          <span class="dash-details-chevron" aria-hidden="true">›</span>
+        </summary>
+        {% if data.anomalies %}
+          <ul class="endnote-list">
+            {% for a in data.anomalies %}
+              <li class="endnote endnote-{{ a.severity }}">
+                <span class="endnote-marker" {% if a.color %}style="background: {{ a.color }};"{% endif %}></span>
+                <span class="endnote-text">
+                  <span class="endnote-title">{{ a.title }}</span>
+                  <span class="endnote-detail">{{ a.detail }}</span>
+                </span>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="endnote-empty">Niets gemarkeerd deze periode.</p>
+        {% endif %}
+      </details>
+    </section>
+  </div>
+
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if data %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  const series = {{ data.monthly_series | tojson }};
+  const pie = {{ data.pie | tojson }};
+  const balanceData = {{ data.balance_trajectory | tojson }};
+  const dowData = {{ data.dow | tojson }};
+  const fixedVarSeries = {{ data.fixed_var.series | tojson }};
+  const channelData = {{ data.channel_mix | tojson }};
+  const topicTrendsData = {{ data.topic_trends | tojson if data.topic_trends else 'null' }};
+  const selectedPeriod = {
+    month: {{ selected_month | tojson }},
+    salary_period: {{ selected_salary_period | tojson }},
+    range: {{ selected_range | tojson }},
+  };
+  const eur = (v) => '€ ' + (v || 0).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+
+  // Palette reads CSS tokens so Chart.js and SVG colors stay in sync with --cat-* in style.css.
+  const css = getComputedStyle(document.documentElement);
+  const palette = {
+    catRule:   css.getPropertyValue('--cat-rule').trim()   || '#5C6E36',
+    catAuto:   css.getPropertyValue('--cat-auto').trim()   || '#80735C',
+    catManual: css.getPropertyValue('--cat-manual').trim() || '#A07852',
+    catUncat:  css.getPropertyValue('--cat-uncat').trim()  || '#C9BB99',
+    pos:       css.getPropertyValue('--pos').trim()        || '#5C6E36',
+    neg:       css.getPropertyValue('--neg').trim()        || '#8E3A23',
+  };
+
+  Chart.defaults.font.family = "'Inter', -apple-system, system-ui, 'Segoe UI', sans-serif";
+  Chart.defaults.color = palette.catAuto;
+
+  // KPI sparkline — 12-month net trend in the Net tile. Render using the SVG's
+  // actual rendered size so the line keeps its true aspect (no horizontal stretch).
+  (function () {
+    const svg = document.getElementById('heroSpark');
+    if (!svg || !series || !series.length) return;
+    const nets = series.map(s => s.net);
+    let lo = Math.min(...nets, 0);
+    let hi = Math.max(...nets, 0);
+    if (hi === lo) { hi = lo + 1; }
+
+    function render() {
+      const rect = svg.getBoundingClientRect();
+      const W = Math.max(40, rect.width);
+      const H = Math.max(16, rect.height);
+      const PAD_X = 2, PAD_Y = 3;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      const xs = (i) => PAD_X + (i / (nets.length - 1 || 1)) * (W - 2 * PAD_X);
+      const ys = (v) => {
+        const t = (v - lo) / (hi - lo);
+        return H - PAD_Y - t * (H - 2 * PAD_Y);
+      };
+      const zeroY = ys(0);
+      const pts = nets.map((v, i) => `${xs(i).toFixed(2)},${ys(v).toFixed(2)}`).join(' ');
+      const areaPts = `${PAD_X},${zeroY.toFixed(2)} ${pts} ${(W - PAD_X).toFixed(2)},${zeroY.toFixed(2)}`;
+      const last = nets[nets.length - 1];
+      const lastColor = last >= 0 ? palette.pos : palette.neg;
+      svg.innerHTML =
+        `<polygon points="${areaPts}" fill="rgba(86,77,62,0.08)"></polygon>` +
+        `<line x1="${PAD_X}" x2="${W - PAD_X}" y1="${zeroY.toFixed(2)}" y2="${zeroY.toFixed(2)}" stroke="#BFB18E" stroke-width="0.6" stroke-dasharray="2 3"></line>` +
+        `<polyline points="${pts}" fill="none" stroke="#564d3e" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"></polyline>` +
+        `<circle cx="${xs(nets.length - 1).toFixed(2)}" cy="${ys(last).toFixed(2)}" r="2.4" fill="${lastColor}"></circle>`;
+    }
+    render();
+    if (typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(render).observe(svg);
+    } else {
+      window.addEventListener('resize', render);
+    }
+  })();
+
+  // Scroll-spy for the in-page TOC
+  (function () {
+    const links = document.querySelectorAll('.diag-toc-link');
+    if (!links.length) return;
+    const map = new Map();
+    links.forEach(a => {
+      const id = a.getAttribute('href').slice(1);
+      const sec = document.getElementById(id);
+      if (sec) map.set(sec, a);
+    });
+    if (!map.size) return;
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        const link = map.get(e.target);
+        if (!link) return;
+        if (e.isIntersecting) {
+          links.forEach(l => l.classList.remove('active'));
+          link.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-140px 0px -65% 0px', threshold: 0 });
+    map.forEach((_, sec) => obs.observe(sec));
+  })();
+
+  // AI insights — three modes fired in parallel against a single Gemini key.
+  // Each card renders independently; one mode failing doesn't block the others.
+  (function () {
+    const row = document.getElementById('sec-ai-row');
+    const allBtn = document.getElementById('aiGenerateAll');
+    if (!row || !allBtn) return;
+
+    const KEY_STORAGE = 'aiSummaryKey';
+    const MODES = ['digest', 'forecast', 'advice'];
+    const PROFILE_URL = '{{ url_for("profile") }}';
+
+    function readKey() {
+      try { return (localStorage.getItem(KEY_STORAGE) || '').trim(); }
+      catch (e) { return ''; }
+    }
+
+    function cardBody(mode) {
+      const card = document.getElementById('sec-ai-' + mode);
+      return card ? card.querySelector('.ai-card-body') : null;
+    }
+
+    function showMessage(body, cls, text) {
+      if (!body) return;
+      body.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = cls;
+      p.textContent = text;
+      body.appendChild(p);
+    }
+
+    function showMissingKey(body) {
+      if (!body) return;
+      body.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'ai-summary-error';
+      p.textContent = 'Geen Gemini API-sleutel opgeslagen. ';
+      const a = document.createElement('a');
+      a.href = PROFILE_URL;
+      a.textContent = 'Voeg er een toe op je Profiel-pagina';
+      p.appendChild(a);
+      p.appendChild(document.createTextNode('.'));
+      body.appendChild(p);
+    }
+
+    function showGenerating(body) {
+      if (!body) return;
+      body.innerHTML = '';
+      const wrap = document.createElement('p');
+      wrap.className = 'ai-summary-hint ai-generating';
+      const svg = '<svg class="ai-spinner" viewBox="0 0 24 24" aria-hidden="true">'
+        + '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="14 42" stroke-linecap="round"/>'
+        + '</svg>';
+      wrap.innerHTML = svg + '<span class="ai-generating-text">Bezig met genereren…</span>';
+      body.appendChild(wrap);
+    }
+
+    function renderResult(body, data) {
+      if (!body) return;
+      body.innerHTML = '';
+      const text = document.createElement('p');
+      text.className = 'ai-summary-text';
+      text.textContent = data.summary || '(leeg antwoord van Gemini)';
+      body.appendChild(text);
+
+      if (data.created_at || data.model) {
+        const meta = document.createElement('p');
+        meta.className = 'ai-summary-meta';
+        const parts = [];
+        if (data.created_at) parts.push('Gegenereerd ' + data.created_at.replace('T', ' ') + ' UTC');
+        if (data.model) parts.push(data.model);
+        meta.textContent = parts.join(' · ');
+        body.appendChild(meta);
+      }
+    }
+
+    async function runMode(mode) {
+      const body = cardBody(mode);
+      const apiKey = readKey();
+      if (!apiKey) { showMissingKey(body); return { ok: false, mode, error: 'missing-key' }; }
+      showGenerating(body);
+      try {
+        const r = await fetch('/api/diagnostics/ai_summary?mode=' + encodeURIComponent(mode) + '&' + periodQueryString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ api_key: apiKey }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          showMessage(body, 'ai-summary-error', data.error || ('Verzoek mislukt (HTTP ' + r.status + ').'));
+          return { ok: false, mode, error: data.error || r.status };
+        }
+        renderResult(body, data);
+        return { ok: true, mode };
+      } catch (e) {
+        showMessage(body, 'ai-summary-error', 'Verzoek mislukt: ' + e.message);
+        return { ok: false, mode, error: e.message };
+      }
+    }
+
+    async function runAll() {
+      const apiKey = readKey();
+      if (!apiKey) {
+        MODES.forEach(m => showMissingKey(cardBody(m)));
+        return;
+      }
+      allBtn.disabled = true;
+      const prev = allBtn.textContent;
+      allBtn.textContent = 'Bezig met genereren…';
+      try {
+        await Promise.allSettled(MODES.map(m => runMode(m)));
+      } finally {
+        allBtn.disabled = false;
+        allBtn.textContent = 'Opnieuw genereren';
+        // Surface that we've now got at least one cached mode for the next click.
+        void prev;
+      }
+    }
+
+    allBtn.addEventListener('click', runAll);
+
+    // Per-card regenerate buttons.
+    row.querySelectorAll('.ai-card-regen').forEach(btn => {
+      btn.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const m = btn.getAttribute('data-mode');
+        if (!m) return;
+        btn.disabled = true;
+        try {
+          await runMode(m);
+          allBtn.textContent = 'Opnieuw genereren';
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+
+    // Phase 5 — auto-generate on a clean period.
+    // Conditions (all must hold):
+    //   uncat_count === 0, fewer than 3 cached modes, API key present,
+    //   user toggle on, session flag not yet set for this period.
+    (function autoGenerate() {
+      try {
+        const uncat = parseInt(row.getAttribute('data-uncat-count') || '0', 10);
+        const autoOn = row.getAttribute('data-auto-generate') === '1';
+        const cached = (row.getAttribute('data-cached-modes') || '')
+          .split(',').filter(s => s.length);
+        if (!autoOn) return;
+        if (uncat !== 0) return;
+        if (cached.length >= MODES.length) return;
+        const apiKey = readKey();
+        if (!apiKey) return;
+        const periodKey = periodQueryString() || 'no-period';
+        const flag = 'aiAutoFired:' + periodKey;
+        if (sessionStorage.getItem(flag)) return;
+        sessionStorage.setItem(flag, '1');
+        // Fire only missing modes — already-cached ones don't need an API call.
+        const missing = MODES.filter(m => cached.indexOf(m) === -1);
+        if (!missing.length) return;
+        allBtn.disabled = true;
+        allBtn.textContent = 'Bezig met genereren…';
+        Promise.allSettled(missing.map(m => runMode(m))).finally(() => {
+          allBtn.disabled = false;
+          allBtn.textContent = 'Opnieuw genereren';
+        });
+      } catch (e) {
+        // Silent — Phase 5 is an enhancement, not critical path.
+      }
+    })();
+  })();
+
+  // Balance trajectory line
+  (function () {
+    const ctx = document.getElementById('balanceChart');
+    if (!ctx || !balanceData.points || !balanceData.points.length) return;
+    const points = balanceData.points;
+    const salaryDates = new Set(balanceData.salary_dates || []);
+    const labels = points.map(p => p.date);
+    const data = points.map(p => p.balance);
+    const pointBg = points.map(p => salaryDates.has(p.date) ? palette.pos : '#564d3e');
+    const pointRadius = points.map(p => salaryDates.has(p.date) ? 5 : 0);
+
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Saldo',
+          data,
+          borderColor: '#564d3e',
+          backgroundColor: 'rgba(86, 77, 62, 0.08)',
+          fill: true,
+          tension: 0.18,
+          borderWidth: 2,
+          pointBackgroundColor: pointBg,
+          pointRadius,
+          pointHoverRadius: 6,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const isSalary = salaryDates.has(ctx.label);
+                return (isSalary ? 'Salarisdag · ' : '') + eur(ctx.parsed.y);
+              },
+            },
+          },
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 11 }, maxTicksLimit: 12 } },
+          y: { ticks: { callback: (v) => '€' + v, font: { size: 11 } }, grid: { color: palette.catUncat } },
+        },
+      },
+    });
+  })();
+
+  // 12-month trend bar chart
+  const trendCtx = document.getElementById('trendChart');
+  if (trendCtx) {
+    new Chart(trendCtx, {
+      type: 'bar',
+      data: {
+        labels: series.map(s => s.label),
+        datasets: [
+          { label: 'Inkomsten', data: series.map(s => s.income),   backgroundColor: palette.pos },
+          { label: 'Uitgaven',  data: series.map(s => s.expenses), backgroundColor: '#8E3A23' },
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: { padding: { left: 6 } },
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 12 } } },
+          tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ' + eur(ctx.parsed.y) } },
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 11 } } },
+          y: { beginAtZero: true, ticks: { callback: (v) => '€' + v, font: { size: 11 }, padding: 4 }, grid: { color: palette.catUncat } }
+        }
+      }
+    });
+  }
+
+  function setPieTotal(amounts) {
+    const el = document.getElementById('pieTotal');
+    if (!el) return;
+    const total = amounts.reduce((a, b) => a + b, 0);
+    el.textContent = eur(total);
+  }
+
+  const pieCtx = document.getElementById('pieChart');
+  let pieChart = null;
+  if (pieCtx && pie.length) {
+    setPieTotal(pie.map(p => p.amount));
+    pieChart = new Chart(pieCtx, {
+      type: 'doughnut',
+      data: {
+        labels: pie.map(p => p.name),
+        datasets: [{
+          data: pie.map(p => p.amount),
+          backgroundColor: pie.map(p => p.color),
+          topicIds: pie.map(p => p.topic_id || null),
+          borderWidth: 1,
+          borderColor: '#fffbf3',
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 }, padding: 8 } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+                const pct = total ? (ctx.parsed / total * 100).toFixed(1) : 0;
+                return ctx.label + ': ' + eur(ctx.parsed) + ' (' + pct + '%)';
+              }
+            }
+          }
+        },
+        cutout: '60%',
+        onClick: (_e, els) => {
+          if (!els || !els.length) return;
+          const idx = els[0].index;
+          const tid = pieChart.data.datasets[0].topicIds[idx];
+          if (!tid) return;  // Uncategorized slice — no drill target
+          drillToTopic(tid);
+        },
+      }
+    });
+  }
+
+  function periodQueryString() {
+    const url = new URL(window.location.href);
+    const params = new URLSearchParams();
+    for (const k of ['month', 'salary_period', 'range']) {
+      const v = url.searchParams.get(k) || selectedPeriod[k];
+      if (v) params.set(k, v);
+    }
+    return params.toString();
+  }
+
+  async function drillToTopic(topicId) {
+    if (!pieChart) return;
+    try {
+      const res = await fetch(`/api/diagnostics/category_pie?topic_id=${encodeURIComponent(topicId)}&${periodQueryString()}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'drill failed');
+      const slices = data.slices || [];
+      pieChart.data.labels = slices.map(s => s.name);
+      pieChart.data.datasets[0].data = slices.map(s => s.amount);
+      pieChart.data.datasets[0].backgroundColor = slices.map(s => s.color);
+      pieChart.data.datasets[0].topicIds = slices.map(() => null);  // disable further drill
+      pieChart.options.onClick = () => {};
+      pieChart.update();
+      setPieTotal(slices.map(s => s.amount));
+      const titleEl = document.getElementById('pieTitle');
+      if (titleEl) titleEl.textContent = `${data.topic.name} · per categorie`;
+      const backBtn = document.getElementById('pieBack');
+      if (backBtn) backBtn.hidden = false;
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  function restoreTopicPie() {
+    if (!pieChart) return;
+    pieChart.data.labels = pie.map(p => p.name);
+    pieChart.data.datasets[0].data = pie.map(p => p.amount);
+    pieChart.data.datasets[0].backgroundColor = pie.map(p => p.color);
+    pieChart.data.datasets[0].topicIds = pie.map(p => p.topic_id || null);
+    pieChart.options.onClick = (_e, els) => {
+      if (!els || !els.length) return;
+      const idx = els[0].index;
+      const tid = pieChart.data.datasets[0].topicIds[idx];
+      if (!tid) return;
+      drillToTopic(tid);
+    };
+    pieChart.update();
+    setPieTotal(pie.map(p => p.amount));
+    const titleEl = document.getElementById('pieTitle');
+    if (titleEl) titleEl.textContent = 'per onderwerp';
+    const backBtn = document.getElementById('pieBack');
+    if (backBtn) backBtn.hidden = true;
+  }
+
+  const pieBackBtn = document.getElementById('pieBack');
+  if (pieBackBtn) pieBackBtn.addEventListener('click', restoreTopicPie);
+
+  // Topic trends — multi-line chart, trailing 12 months
+  (function () {
+    const ctx = document.getElementById('topicTrendsChart');
+    if (!ctx || !topicTrendsData || !topicTrendsData.series.length) return;
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: topicTrendsData.months.map(m => m.label),
+        datasets: topicTrendsData.series.map(s => ({
+          label: s.name,
+          data: s.data,
+          borderColor: s.color,
+          backgroundColor: s.color + '20',
+          borderWidth: 2,
+          tension: 0.25,
+          pointRadius: 2,
+          pointHoverRadius: 4,
+        }))
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 }, padding: 8 } },
+          tooltip: {
+            callbacks: { label: (ctx) => `${ctx.dataset.label}: ${eur(ctx.parsed.y)}` }
+          }
+        },
+        scales: {
+          y: { beginAtZero: true, ticks: { callback: (v) => eur(v) } }
+        }
+      }
+    });
+  })();
+
+  // Day-of-week bar
+  (function () {
+    const ctx = document.getElementById('dowChart');
+    if (!ctx) return;
+    new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: dowData.by_dow.map(d => d.label),
+        datasets: [{
+          label: 'Gem. uitgaven per dag',
+          data: dowData.by_dow.map(d => d.average),
+          backgroundColor: palette.catAuto,
+          borderRadius: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: (ctx) => eur(ctx.parsed.y) + ' gem. per dag' } },
+        },
+        scales: {
+          x: { grid: { display: false } },
+          y: { beginAtZero: true, ticks: { callback: (v) => '€' + v }, grid: { color: palette.catUncat } },
+        },
+      },
+    });
+  })();
+
+  // Fixed vs variable — 6-month stacked
+  (function () {
+    const ctx = document.getElementById('fixedVarChart');
+    if (!ctx) return;
+    new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: fixedVarSeries.map(s => s.label),
+        datasets: [
+          { label: 'Vast', data: fixedVarSeries.map(s => s.fixed), backgroundColor: palette.catAuto, stack: 's' },
+          { label: 'Variabel', data: fixedVarSeries.map(s => s.variable), backgroundColor: palette.catManual, stack: 's' },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } },
+          tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ' + eur(ctx.parsed.y) } },
+        },
+        scales: {
+          x: { stacked: true, grid: { display: false } },
+          y: { stacked: true, beginAtZero: true, ticks: { callback: (v) => '€' + v }, grid: { color: palette.catUncat } },
+        },
+      },
+    });
+  })();
+
+  // Channel mix — stacked area
+  (function () {
+    const ctx = document.getElementById('channelChart');
+    if (!ctx || !channelData.series.length) return;
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: channelData.months.map(m => m.label),
+        datasets: channelData.series.map(s => ({
+          label: s.label,
+          data: s.data,
+          borderColor: s.color,
+          backgroundColor: s.color + 'cc',
+          fill: true,
+          tension: 0.25,
+          pointRadius: 2,
+        })),
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } },
+          tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ' + eur(ctx.parsed.y) } },
+        },
+        scales: {
+          x: { grid: { display: false } },
+          y: { stacked: true, beginAtZero: true, ticks: { callback: (v) => '€' + v }, grid: { color: palette.catUncat } },
+        },
+      },
+    });
+  })();
+
+  // Calendar heatmap — pure DOM
+  (function () {
+    const host = document.getElementById('heatmapHost');
+    if (!host) return;
+    const data = JSON.parse(host.dataset.heatmap);
+    if (!data || !data.days || !data.days.length) return;
+
+    // Absolute-euro thresholds: each upper bound is inclusive (e.g. €10 → tier 1).
+    const tiers = [0, 10, 25, 50, 100];
+    const colors = ['#EBE0C8', '#D4C8AA', '#BAA07E', '#A07852', '#8E5A2C', '#5C3815'];
+    function tier(amount) {
+      if (amount <= 0) return 0;
+      for (let i = 1; i < tiers.length; i++) if (amount <= tiers[i]) return i;
+      return colors.length - 1;
+    }
+
+    const cols = [];
+    let currentCol = null;
+    for (const day of data.days) {
+      if (day.weekday === 0 || currentCol === null) {
+        currentCol = Array(7).fill(null);
+        cols.push(currentCol);
+      }
+      currentCol[day.weekday] = day;
+    }
+
+    const fmt = (iso) => {
+      const d = new Date(iso + 'T00:00:00');
+      return d.toLocaleDateString('nl-NL', { weekday: 'short', month: 'short', day: 'numeric' });
+    };
+
+    const grid = document.createElement('div');
+    grid.className = 'heatmap-grid';
+    const dayLabels = document.createElement('div');
+    dayLabels.className = 'heatmap-daylabels';
+    ['Ma', '', 'Wo', '', 'Vr', '', 'Zo'].forEach(t => {
+      const c = document.createElement('div');
+      c.className = 'heatmap-daylabel';
+      c.textContent = t;
+      dayLabels.appendChild(c);
+    });
+    grid.appendChild(dayLabels);
+
+    const monthLabelTrack = document.createElement('div');
+    monthLabelTrack.className = 'heatmap-monthtrack';
+
+    const cells = document.createElement('div');
+    cells.className = 'heatmap-cells';
+
+    // Detect month-boundary indices (ci values that start a new month, excluding ci=0)
+    // so we can insert real spacer tracks in the grid between months.
+    const monthStarts = new Set();
+    {
+      let pm = null;
+      cols.forEach((col, ci) => {
+        const fd = col.find(c => c);
+        const mm = fd ? fd.date.slice(0, 7) : null;
+        if (mm && mm !== pm) {
+          if (ci > 0) monthStarts.add(ci);
+          pm = mm;
+        }
+      });
+    }
+    const MONTH_GAP = '8px';
+    const trackParts = [];
+    for (let ci = 0; ci < cols.length; ci++) {
+      if (monthStarts.has(ci)) trackParts.push(MONTH_GAP);
+      trackParts.push('1fr');
+    }
+    const columnsTemplate = trackParts.join(' ');
+    cells.style.gridTemplateColumns = columnsTemplate;
+    monthLabelTrack.style.gridTemplateColumns = columnsTemplate;
+
+    // Map ci → 1-indexed grid column (skipping over inserted spacer tracks).
+    const gridColFor = (ci) => {
+      let pos = 1;
+      for (let i = 0; i < ci; i++) {
+        if (monthStarts.has(i)) pos++;
+        pos++;
+      }
+      if (monthStarts.has(ci)) pos++;
+      return pos;
+    };
+
+    let prevMonth = null;
+    cols.forEach((col, ci) => {
+      const firstDay = col.find(c => c);
+      const m = firstDay ? firstDay.date.slice(0, 7) : null;
+      const gridCol = gridColFor(ci);
+      const ml = document.createElement('div');
+      ml.className = 'heatmap-monthlabel';
+      ml.style.gridColumn = gridCol.toString();
+      if (m && m !== prevMonth) {
+        const dt = new Date(firstDay.date + 'T00:00:00');
+        ml.textContent = dt.toLocaleDateString('nl-NL', { month: 'short' });
+        prevMonth = m;
+      }
+      monthLabelTrack.appendChild(ml);
+
+      for (let row = 0; row < 7; row++) {
+        const cell = document.createElement('div');
+        cell.className = 'heatmap-cell';
+        cell.style.gridColumn = gridCol.toString();
+        cell.style.gridRow = (row + 1).toString();
+        const day = col[row];
+        if (day) {
+          const t = tier(day.amount);
+          cell.style.background = colors[t];
+          cell.dataset.tip = `${fmt(day.date)} · ${eur(day.amount)} · klik voor transacties`;
+          cell.dataset.date = day.date;
+          cell.setAttribute('role', 'link');
+          cell.setAttribute('tabindex', '0');
+          cell.setAttribute('aria-label', `${fmt(day.date)}, ${eur(day.amount)}. Bekijk transacties.`);
+          if (day.amount === 0) cell.classList.add('heatmap-cell-zero');
+        } else {
+          cell.classList.add('heatmap-cell-empty');
+        }
+        cells.appendChild(cell);
+      }
+    });
+
+    const tip = document.createElement('div');
+    tip.className = 'heatmap-tip';
+    document.body.appendChild(tip);
+    let currentCell = null;
+    function positionTip(target) {
+      const r = target.getBoundingClientRect();
+      const tr = tip.getBoundingClientRect();
+      let left = r.left + r.width / 2 - tr.width / 2;
+      left = Math.max(8, Math.min(left, window.innerWidth - tr.width - 8));
+      let top = r.top - tr.height - 8;
+      if (top < 8) top = r.bottom + 8;
+      tip.style.left = left + 'px';
+      tip.style.top = top + 'px';
+    }
+    function showTip(target) {
+      const text = target.dataset.tip;
+      if (!text) { hideTip(); return; }
+      tip.textContent = text;
+      tip.classList.add('visible');
+      positionTip(target);
+    }
+    function hideTip() {
+      tip.classList.remove('visible');
+      currentCell = null;
+    }
+    cells.addEventListener('mouseover', (e) => {
+      const c = e.target.closest('.heatmap-cell');
+      if (!c || c === currentCell) return;
+      currentCell = c;
+      showTip(c);
+    });
+    cells.addEventListener('mouseleave', hideTip);
+    window.addEventListener('scroll', hideTip, true);
+    const navigateToDay = (cell) => {
+      const d = cell && cell.dataset && cell.dataset.date;
+      if (d) window.location.href = `/transactions?date=${encodeURIComponent(d)}`;
+    };
+    cells.addEventListener('click', (e) => {
+      const c = e.target.closest('.heatmap-cell');
+      if (c) navigateToDay(c);
+    });
+    cells.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const c = e.target.closest('.heatmap-cell');
+      if (c && c.dataset.date) { e.preventDefault(); navigateToDay(c); }
+    });
+
+    const right = document.createElement('div');
+    right.className = 'heatmap-right';
+    right.appendChild(monthLabelTrack);
+    right.appendChild(cells);
+
+    grid.appendChild(right);
+
+    const legend = document.createElement('div');
+    legend.className = 'heatmap-legend small muted';
+    legend.innerHTML =
+      '<span>Minder</span>' +
+      colors.map(c => `<span class="heatmap-swatch" style="background:${c};"></span>`).join('') +
+      '<span>Meer</span>';
+
+    host.appendChild(grid);
+    host.appendChild(legend);
+  })();
+</script>
+{% endif %}
+{% endblock %}

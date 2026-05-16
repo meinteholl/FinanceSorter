@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Inloggen · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+  <div class="auth-card">
+    <h1 class="auth-title">Welkom terug</h1>
+    <p class="auth-sub">Log in om je financiële status te bekijken.</p>
+
+    <form method="post" class="auth-form" novalidate>
+      {% if request.args.get('next') %}
+        <input type="hidden" name="next" value="{{ request.args.get('next') }}">
+      {% endif %}
+
+      <label class="auth-field">
+        <span>E-mail</span>
+        <input type="email" name="email" value="{{ email }}" autocomplete="email" autofocus required>
+      </label>
+
+      <label class="auth-field">
+        <span>Wachtwoord</span>
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+
+      <button type="submit" class="auth-submit">Inloggen</button>
+    </form>
+
+    {% if not signup_locked %}
+    <p class="auth-switch">
+      Nog geen account? <a href="{{ url_for('signup') }}">Maak er een aan</a>
+    </p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

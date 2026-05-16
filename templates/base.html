@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Finance Sorter{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400..700;1,6..72,400..700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <a href="{{ url_for('transactions') if current_user else url_for('login') }}">Finance<em>·</em>Sorter</a>
+    </div>
+    {% if current_user %}
+    <nav class="nav">
+      <a href="{{ url_for('transactions') }}" class="nav-link {% if request.endpoint == 'transactions' %}active{% endif %}">Transacties</a>
+      <a href="{{ url_for('diagnostics') }}" class="nav-link {% if request.endpoint == 'diagnostics' %}active{% endif %}">Diagnostiek</a>
+      <a href="{{ url_for('savings') }}" class="nav-link {% if request.endpoint == 'savings' %}active{% endif %}">Sparen</a>
+      <a href="{{ url_for('categories') }}" class="nav-link {% if request.endpoint == 'categories' %}active{% endif %}">Categorieën</a>
+      <a href="{{ url_for('rules') }}" class="nav-link {% if request.endpoint == 'rules' %}active{% endif %}">Regels</a>
+    </nav>
+    {% endif %}
+  </header>
+
+  {% if current_user %}
+  <div id="page-dropzone" class="page-dropzone" aria-hidden="true">
+    <div class="page-dropzone-frame">
+      <div class="page-dropzone-icon">↑</div>
+      <div class="page-dropzone-title">Sleep CSV hierheen om te importeren</div>
+      <div class="page-dropzone-sub">ING- of ASN-export · duplicaten worden overgeslagen</div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% with msgs = get_flashed_messages(with_categories=true) %}
+    {% if msgs %}
+      <div class="toast-stack" id="toast-stack">
+        {% for cat, m in msgs %}
+          <div class="toast toast-{{ cat }}">{{ m }}</div>
+        {% endfor %}
+      </div>
+      <script>
+        setTimeout(function () {
+          var s = document.getElementById('toast-stack');
+          if (s) s.remove();
+        }, 5500);
+      </script>
+    {% endif %}
+  {% endwith %}
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

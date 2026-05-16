@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Account aanmaken · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+  <div class="auth-card">
+    <h1 class="auth-title">Maak je account aan</h1>
+    <p class="auth-sub">Krijg privétoegang tot je financiële status.</p>
+
+    <form method="post" class="auth-form" novalidate>
+      <label class="auth-field">
+        <span>Naam</span>
+        <input type="text" name="name" value="{{ name }}" autocomplete="name" autofocus required>
+      </label>
+
+      <label class="auth-field">
+        <span>E-mail</span>
+        <input type="email" name="email" value="{{ email }}" autocomplete="email" required>
+      </label>
+
+      <label class="auth-field">
+        <span>Wachtwoord</span>
+        <input type="password" name="password" autocomplete="new-password" minlength="8" required>
+        <small class="auth-hint">Minimaal 8 tekens.</small>
+      </label>
+
+      <label class="auth-field">
+        <span>Wachtwoord bevestigen</span>
+        <input type="password" name="confirm" autocomplete="new-password" minlength="8" required>
+      </label>
+
+      <button type="submit" class="auth-submit">Account aanmaken</button>
+    </form>
+
+    <p class="auth-switch">
+      Heb je al een account? <a href="{{ url_for('login') }}">Inloggen</a>
+    </p>
+  </div>
+</div>
+{% endblock %}

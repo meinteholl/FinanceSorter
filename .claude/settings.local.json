@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('db.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(node --check static/app.js)",
+      "Bash(python -c ' *)",
+      "Bash(python app.py)",
+      "Bash(curl -s -o /dev/null -w '%{http_code}\\\\n' http://127.0.0.1:5004/transactions)",
+      "Bash(curl -s -o /dev/null -w 'transactions: %{http_code}\\\\n' http://127.0.0.1:5004/transactions)",
+      "Bash(curl -s -o /dev/null -w 'rules:        %{http_code}\\\\n' http://127.0.0.1:5004/rules)",
+      "Bash(curl -s -o /dev/null -w 'categories:   %{http_code}\\\\n' http://127.0.0.1:5004/categories)",
+      "Bash(curl -s -o /dev/null -w 'upload:       %{http_code}\\\\n' http://127.0.0.1:5004/upload)",
+      "Bash(curl -s -o /dev/null -w 'api/summary:  %{http_code}\\\\n' http://127.0.0.1:5004/api/summary)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(.venv/Scripts/python.exe -c ' *)"
+    ]
+  }
+}

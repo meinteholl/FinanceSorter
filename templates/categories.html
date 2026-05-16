@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}Categorieën · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="categories-page">
+
+  <div class="page-head">
+    <h1 class="page-title">Onderwerpen &amp; Categorieën</h1>
+  </div>
+
+  <div class="topic-row">
+    <section class="topic-col topic-col-add">
+      <button type="button" class="topic-col-add-btn" onclick="openAddTopic()">+ Onderwerp toevoegen</button>
+      <form id="add-topic-form" method="post" action="{{ url_for('topics') }}" class="add-topic-form" hidden>
+        <input type="hidden" name="action" value="create">
+        <input type="text" name="name" placeholder="Naam onderwerp" required>
+        <label class="edit-label">Kleur
+          <input type="color" name="color" value="{{ next_topic_color }}">
+        </label>
+        <div class="add-topic-form-actions">
+          <button class="btn btn-primary btn-sm">Aanmaken</button>
+          <button type="button" class="btn btn-ghost btn-sm" onclick="closeAddTopic()">Annuleren</button>
+        </div>
+      </form>
+    </section>
+    {% for t in topics %}
+    <section class="topic-col" data-topic-id="{{ t.id }}">
+      <header class="topic-col-head">
+        <h2 class="topic-col-title">
+          <span class="dot" style="background: {{ t.color }};"></span>{{ t.name }}
+        </h2>
+        <div class="topic-actions">
+          <button type="button" class="icon-btn" title="Onderwerp bewerken" onclick="toggleTopicEdit({{ t.id }})">✎</button>
+          {% if not t.is_salary_topic %}
+          <form method="post" action="{{ url_for('topics') }}" class="inline-form"
+                onsubmit="return confirm('Onderwerp \'{{ t.name }}\' verwijderen? De bijbehorende categorieën worden ook verwijderd.');">
+            <input type="hidden" name="action" value="delete">
+            <input type="hidden" name="id" value="{{ t.id }}">
+            <button class="icon-btn" title="Onderwerp verwijderen">×</button>
+          </form>
+          {% endif %}
+        </div>
+      </header>
+
+      <div class="topic-badges">
+        {% if t.is_salary_topic %}<span class="topic-badge">salaris</span>{% endif %}
+        {% if t.exclude_from_totals %}<span class="topic-badge">uitgesloten</span>{% endif %}
+        {% if t.is_fixed %}<span class="topic-badge">vast</span>{% endif %}
+      </div>
+
+      <div class="topic-edit-panel" id="topic-edit-{{ t.id }}" hidden>
+        <form method="post" action="{{ url_for('topics') }}" class="edit-row">
+          <input type="hidden" name="action" value="rename">
+          <input type="hidden" name="id" value="{{ t.id }}">
+          <input type="text" name="name" value="{{ t.name }}" required>
+          <button class="btn btn-ghost btn-sm">Hernoemen</button>
+        </form>
+        <form method="post" action="{{ url_for('topics') }}" class="edit-row">
+          <input type="hidden" name="action" value="recolor">
+          <input type="hidden" name="id" value="{{ t.id }}">
+          <label class="edit-label">Kleur
+            <input type="color" name="color" value="{{ t.color }}" onchange="this.form.submit()">
+          </label>
+          <code class="muted small">{{ t.color }}</code>
+        </form>
+        <div class="edit-row">
+          <form method="post" action="{{ url_for('topics') }}" class="inline-form">
+            <input type="hidden" name="action" value="toggle_exclude">
+            <input type="hidden" name="id" value="{{ t.id }}">
+            <button class="btn btn-ghost toggle-pill {% if t.exclude_from_totals %}toggle-on{% endif %}" type="submit">
+              {% if t.exclude_from_totals %}✓ Uitgesloten van totalen{% else %}Inbegrepen in totalen{% endif %}
+            </button>
+          </form>
+          <form method="post" action="{{ url_for('topics') }}" class="inline-form">
+            <input type="hidden" name="action" value="toggle_fixed">
+            <input type="hidden" name="id" value="{{ t.id }}">
+            <button class="btn btn-ghost toggle-pill {% if t.is_fixed %}toggle-on{% endif %}" type="submit"
+                    {% if t.exclude_from_totals %}disabled title="Uitgesloten onderwerpen tellen nooit als vast"{% endif %}>
+              {% if t.is_fixed %}✓ Vaste kosten{% else %}Variabel{% endif %}
+            </button>
+          </form>
+        </div>
+      </div>
+
+      <ul class="cat-list">
+        {% for c in t.categories %}
+        <li class="cat-item" data-cat-id="{{ c.id }}">
+          <div class="cat-row">
+            <span class="cat-name">
+              <span class="dot" style="background: {{ c.effective_color }};"></span>{{ c.name }}
+            </span>
+            <div class="cat-badges">
+              {% if c.is_primary_salary %}<span class="cat-badge">primair</span>{% endif %}
+              {% if c.is_auto_color %}<span class="cat-badge">auto kleur</span>{% endif %}
+            </div>
+            <div class="cat-actions">
+              <button type="button" class="icon-btn" title="Categorie bewerken" onclick="toggleCatEdit({{ c.id }})">✎</button>
+              {% if not c.is_primary_salary %}
+              <form method="post" class="inline-form"
+                    onsubmit="return confirm('Categorie \'{{ c.name }}\' verwijderen? Transacties worden ongecategoriseerd.');">
+                <input type="hidden" name="action" value="delete">
+                <input type="hidden" name="id" value="{{ c.id }}">
+                <button class="icon-btn" title="Categorie verwijderen">×</button>
+              </form>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="cat-edit-panel" id="cat-edit-{{ c.id }}" hidden>
+            <form method="post" class="edit-row">
+              <input type="hidden" name="action" value="rename">
+              <input type="hidden" name="id" value="{{ c.id }}">
+              <input type="text" name="name" value="{{ c.name }}" required>
+              <button class="btn btn-ghost btn-sm">Hernoemen</button>
+            </form>
+            <form method="post" class="edit-row">
+              <input type="hidden" name="action" value="recolor">
+              <input type="hidden" name="id" value="{{ c.id }}">
+              <label class="edit-label">Kleur
+                <input type="color" name="color" value="{{ c.effective_color }}" onchange="this.form.submit()">
+              </label>
+            </form>
+            {% if t.is_salary_topic and not c.is_primary_salary %}
+            <form method="post" class="edit-row">
+              <input type="hidden" name="action" value="set_primary_salary">
+              <input type="hidden" name="id" value="{{ c.id }}">
+              <button class="btn btn-ghost toggle-pill" type="submit">Maak primair salaris</button>
+            </form>
+            {% endif %}
+          </div>
+        </li>
+        {% endfor %}
+
+        <li class="cat-add">
+          <button type="button" class="cat-add-btn" onclick="openAddCat({{ t.id }})">+ Categorie toevoegen</button>
+          <form method="post" action="{{ url_for('categories') }}" id="add-cat-form-{{ t.id }}" class="add-cat-form" hidden>
+            <input type="hidden" name="action" value="create">
+            <input type="hidden" name="topic_id" value="{{ t.id }}">
+            <input type="text" name="name" placeholder="Naam categorie" required>
+            <button class="btn btn-primary btn-sm">Toevoegen</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="closeAddCat({{ t.id }})">Annuleren</button>
+          </form>
+        </li>
+      </ul>
+    </section>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function openAddTopic() {
+    var f = document.getElementById('add-topic-form');
+    f.hidden = false;
+    var n = f.querySelector('input[name="name"]');
+    if (n) n.focus();
+  }
+  function closeAddTopic() {
+    document.getElementById('add-topic-form').hidden = true;
+  }
+  function openAddCat(id) {
+    var f = document.getElementById('add-cat-form-' + id);
+    f.hidden = false;
+    var n = f.querySelector('input[name="name"]');
+    if (n) n.focus();
+  }
+  function closeAddCat(id) {
+    document.getElementById('add-cat-form-' + id).hidden = true;
+  }
+  function toggleTopicEdit(id) {
+    var p = document.getElementById('topic-edit-' + id);
+    p.hidden = !p.hidden;
+  }
+  function toggleCatEdit(id) {
+    var p = document.getElementById('cat-edit-' + id);
+    p.hidden = !p.hidden;
+  }
+
+  // Preserve .topic-row horizontal scroll across the POST/redirect cycle
+  // (the form submits cause a full page reload and the inner scroll container
+  // would otherwise reset to 0).
+  (function () {
+    var row = document.querySelector('.topic-row');
+    if (!row) return;
+    var KEY = 'categories-topic-row-scroll';
+    var saved = sessionStorage.getItem(KEY);
+    if (saved !== null) {
+      row.scrollLeft = parseInt(saved, 10) || 0;
+      sessionStorage.removeItem(KEY);
+    }
+    row.addEventListener('submit', function () {
+      sessionStorage.setItem(KEY, String(row.scrollLeft));
+    }, true);
+  })();
+</script>
+{% endblock %}

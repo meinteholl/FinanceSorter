@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block title %}Transacties · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="tx-layout">
+  <aside class="tx-side">
+    <form method="get" class="filters card">
+      <div class="filter">
+        <label>Maand</label>
+        <select name="month" onchange="this.form.submit()">
+          <option value="">Alle maanden</option>
+          {% for m in months %}
+            <option value="{{ m.value }}" {% if m.value == selected_month %}selected{% endif %}>{{ m.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="filter">
+        <label>Salarisperiode</label>
+        <select name="salary_period" onchange="this.form.submit()" {% if not salary_periods %}disabled title="Categoriseer een transactie als Salaris om salarisperiodes te activeren"{% endif %}>
+          <option value="">Alle</option>
+          {% for p in salary_periods %}
+            <option value="{{ p.start }}" {% if p.start == selected_salary_period %}selected{% endif %}>{{ p.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="filter">
+        <label>Categorie</label>
+        <select name="category" class="cat-filter-select" data-cd-skip onchange="this.form.submit()">
+          <option value="">Alle</option>
+          <option value="uncategorized" {% if selected_category == 'uncategorized' %}selected{% endif %}>Alleen ongecategoriseerd</option>
+          {% for c in categories %}
+            <option value="{{ c.id }}" {% if selected_category == c.id|string %}selected{% endif %}>{{ c.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="filter">
+        <label>Stroom</label>
+        <select name="flow" onchange="this.form.submit()">
+          <option value=""          {% if not selected_flow or selected_flow == 'all' %}selected{% endif %}>Alle</option>
+          <option value="income"    {% if selected_flow == 'income'    %}selected{% endif %}>Alleen inkomsten</option>
+          <option value="expenses"  {% if selected_flow == 'expenses'  %}selected{% endif %}>Alleen uitgaven</option>
+          <option value="excluded"  {% if selected_flow == 'excluded'  %}selected{% endif %}>Overschrijvingen (uitgesloten)</option>
+        </select>
+      </div>
+      <div class="filter grow">
+        <label>Zoeken</label>
+        <input type="search" name="q" value="{{ q }}" placeholder="Naam, tegenpartij, opmerking..." data-auto-submit="400">
+      </div>
+    </form>
+
+    {% if current_user %}
+    {% set initial = (current_user.name or current_user.email or '?')[:1] | upper %}
+    <a href="{{ url_for('profile') }}" class="profile-btn" aria-label="Profiel openen">
+      <span class="profile-avatar" aria-hidden="true">{{ initial }}</span>
+      <span class="profile-text">
+        <span class="profile-name">{{ current_user.name }}</span>
+        <span class="profile-hint">Profiel bekijken</span>
+      </span>
+    </a>
+    {% endif %}
+  </aside>
+
+  <div class="tx-main">
+    <div class="page-head">
+      <h1 class="page-title">Transacties</h1>
+      {% if selected_date %}
+        <a href="{{ url_for('transactions') }}" class="filter-chip" title="Dagfilter wissen">
+          Dag · {{ selected_date }}
+          <span class="filter-chip-x" aria-hidden="true">×</span>
+        </a>
+      {% endif %}
+    </div>
+
+    <div class="tiles">
+      <div class="tile">
+        <div class="tile-label">Inkomsten{% if excluded_count %} <span class="tile-hint" title="Sluit categorieën uit die zijn gemarkeerd als 'alleen overschrijving' (bijv. Sparen/Overschrijvingen)">·  excl. overschrijvingen</span>{% endif %}</div>
+        <div class="tile-value pos">{{ income | eur }}</div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">Uitgaven{% if excluded_count %} <span class="tile-hint">·  excl. overschrijvingen</span>{% endif %}</div>
+        <div class="tile-value neg">{{ expenses | eur }}</div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">Netto</div>
+        <div class="tile-value {% if net >= 0 %}pos{% else %}neg{% endif %}">{{ net | eur }}</div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">Ongecategoriseerd</div>
+        <div class="tile-value" id="uncat-count">{{ uncat_count }}</div>
+      </div>
+    </div>
+
+    <div class="card table-card">
+  <div class="data-list"
+       data-categories='{{ categories | map(attribute="id") | list | tojson }}'
+       data-picker-topics='{{ picker_topics | tojson }}'>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th class="sortable" data-sort-key="date" data-sort-default="desc" aria-sort="none">Datum</th>
+          <th class="sortable" data-sort-key="name" aria-sort="none">Naam</th>
+          <th></th>
+          <th class="num col-amount sortable" data-sort-key="amount" data-sort-type="number" data-sort-default="desc" aria-sort="none">Bedrag</th>
+          <th class="cell-cat">Categorie</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        {% set sug = (suggestions.get(r.id) if not r.is_ghost else None) %}
+        {% set selected_cat_id = sug.category_id if sug else r.category_id %}
+        {% set is_auto = r.categorization_source in ('auto_high_conf', 'auto_recurring') %}
+        {% set is_child = r.match_parent_id is not none %}
+        {% set is_ghost = r.is_ghost %}
+        {% set is_parent = r.is_matched and not is_child and not is_ghost %}
+        {% set show_dir = r.display_direction %}
+        {% set show_amt = r.display_amount %}
+        <tr {% if not is_ghost %}data-tx="{{ r.id }}"{% endif %}
+            data-amount="{{ r.amount }}"
+            data-direction="{{ r.direction }}"
+            data-date="{{ r.date }}"
+            data-name="{{ r.name or '' }}"
+            data-counterparty="{{ r.counterparty or '' }}"
+            data-notifications="{{ r.notifications or '' }}"
+            class="tx-row{% if is_child %} tx-row-child{% endif %}{% if is_parent %} tx-row-parent{% endif %}{% if is_ghost %} tx-row-child tx-row-ghost{% endif %}"
+            {% if is_child %}data-match-parent="{{ r.match_parent_id }}"{% endif %}
+            {% if sug %}data-sug-cat="{{ sug.category_id }}" data-sug-source="{{ sug.signal_source or '' }}" data-sug-key="{{ sug.signal_key or '' }}"{% if sug.source == 'recurring' %} data-sug-recurring="1"{% endif %}{% endif %}>
+          <td class="nowrap cell-date" data-sort="{{ r.date }}">
+            {% if not is_child and not is_parent and not is_ghost %}
+              <span class="drag-handle" aria-hidden="true" title="Sleep omhoog of omlaag om aan een andere transactie te koppelen">⋮⋮</span>
+            {% endif %}
+            <span class="date-text">{{ r.date }}</span>
+            {% if is_child %}
+              <span class="match-link" title="Terugbetaling gekoppeld aan bijbehorende uitgave">↳ terugbetaling</span>
+            {% elif is_ghost %}
+              <span class="match-link" title="Oorspronkelijke uitgave vóór terugbetalingen">↳ origineel</span>
+            {% endif %}
+          </td>
+          <td data-sort="{{ (r.name or '') | lower }}">
+            <div class="tx-name">{{ r.name }}</div>
+            <div class="tx-note">{{ r.transaction_type }}{% if r.notifications %} · {{ r.notifications[:90] }}{% if r.notifications|length > 90 %}…{% endif %}{% endif %}</div>
+          </td>
+          <td class="muted small">
+            {% if (is_child or is_parent) and not is_ghost %}
+              <button type="button" class="btn-unmatch" data-tx="{{ r.id }}" title="Deze koppeling ontkoppelen">ontkoppelen</button>
+            {% endif %}
+          </td>
+          <td class="num col-amount nowrap {% if show_dir == 'Debit' %}neg{% else %}pos{% endif %}"
+              data-sort="{% if show_dir == 'Debit' %}-{% endif %}{{ show_amt }}">
+            {% if show_dir == 'Debit' %}−{% else %}+{% endif %}{{ show_amt | eur }}
+          </td>
+          <td class="cell-cat">
+            {% if is_ghost %}
+              {# Ghost row is display-only: no dropdown, no learn toggle. #}
+              {% if r.category_name %}
+                <span class="ghost-cat" style="color: {{ r.category_color or r.topic_color or '#94a3b8' }};">{{ r.category_name }}</span>
+              {% endif %}
+            {% else %}
+            <div class="cat-row">
+              <div class="cat-select{% if sug %} cat-select-pending{% endif %}"
+                   data-tx="{{ r.id }}"
+                   data-selected="{{ selected_cat_id or '' }}"
+                   {% if sug %}data-pending="1" data-pending-color="{{ sug.category_color }}"{% endif %}></div>
+              <input type="hidden" class="cat-select-input" data-tx="{{ r.id }}" value="{{ selected_cat_id or '' }}">
+              {% if sug %}
+                <button type="button" class="btn-accept-sug" data-tx="{{ r.id }}" title="Bevestig deze suggestie">Accepteren</button>
+                <button type="button" class="btn-reject-sug" data-tx="{{ r.id }}" title="Deze suggestie is onjuist — niet meer voorstellen">Afwijzen</button>
+              {% endif %}
+              {% if is_auto and not sug %}
+                <span class="auto-badge" title="Automatisch gecategoriseerd · {{ 'terugkerende transactie' if r.categorization_source == 'auto_recurring' else 'overeenkomst met hoge zekerheid' }}. Wijzig de categorie hier om af te wijken.">auto</span>
+              {% endif %}
+              <label class="learn-toggle" title="Opslaan als regel gekoppeld aan dit bedrag (±5%) en toepassen op alle overeenkomende ongecategoriseerde transacties. Klik om deze categorisering als vast te markeren.">
+                <input type="checkbox" class="learn-chk" data-tx="{{ r.id }}">
+                <span class="learn-chip">Vast</span>
+              </label>
+            </div>
+            {% if sug %}
+              <div class="sug-hint" title="{{ sug.signals | join(' + ') if sug.signals else 'geschiedenis' }} · {{ sug.tier }} niveau">
+                <span class="sug-dot" style="background: {{ sug.category_color }};"></span>
+                {% if sug.tier == 'AUTO' %}Hoge zekerheid{% else %}Voorgesteld{% endif %} · op basis van {{ sug.sample_count }} vergelijkbare
+              </div>
+            {% endif %}
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">Geen transacties voldoen aan deze filters.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+  </div>
+</div>
+{% endblock %}

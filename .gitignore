@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+
+# PyInstaller output
+build/
+dist/
+
+# SQLite (per-user data, never commit)
+data/finance.db
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/binaries/*.exe
+
+# Build & runtime logs
+tauri-build.log
+tauri-bundle.log
+tauri-app-*.log
+sidecar-*.log
+
+# Source PNG for the icon suite (regenerable via cargo tauri icon)
+app-icon.png
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/

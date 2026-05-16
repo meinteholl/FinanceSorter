@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Sparen · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="savings-page">
+<div class="page-head">
+  <div>
+    <h1 class="page-title">Sparen</h1>
+    <p class="page-sub">Geld dat heen en weer gaat tussen betaal- en spaarrekening, per maand.</p>
+  </div>
+</div>
+
+{% if not data.monthly %}
+  <p class="muted">Nog geen spaaractiviteit. Categoriseer een overschrijving als <strong>Sparen/Overschrijvingen</strong> op de Transacties-pagina en deze verschijnt hier.</p>
+{% else %}
+
+  <div class="tiles">
+    <div class="tile">
+      <span class="tile-label">Totaal gespaard</span>
+      <div class="tile-value {% if data.net_total >= 0 %}pos{% else %}neg{% endif %}">
+        {% if data.net_total >= 0 %}+{% else %}−{% endif %}{{ data.net_total | abs | eur }}
+      </div>
+    </div>
+    <div class="tile">
+      <span class="tile-label">Toegevoegd aan spaargeld</span>
+      <div class="tile-value pos">+{{ data.total_in | eur }}</div>
+    </div>
+    <div class="tile">
+      <span class="tile-label">Opgenomen uit spaargeld</span>
+      <div class="tile-value neg">−{{ data.total_out | eur }}</div>
+    </div>
+    <div class="tile">
+      <span class="tile-label">Gem. netto per maand</span>
+      <div class="tile-value {% if data.avg_net >= 0 %}pos{% else %}neg{% endif %}">
+        {% if data.avg_net >= 0 %}+{% else %}−{% endif %}{{ data.avg_net | abs | eur }}
+        <small>· {{ data.months_count }} mnd</small>
+      </div>
+    </div>
+  </div>
+
+  <h2 class="section-head">Overzicht per maand</h2>
+  <div class="card table-card">
+    <table class="data-table savings-table">
+      <thead>
+        <tr>
+          <th>Maand</th>
+          <th class="num">Toegevoegd</th>
+          <th class="num">Opgenomen</th>
+          <th class="num">Netto gespaard</th>
+          <th class="num">Tx</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in data.monthly %}
+          <tr class="savings-month-row" data-month="{{ m.month }}">
+            <td>
+              <div class="tx-name">
+                <button type="button" class="savings-toggle" aria-expanded="false" aria-controls="m-{{ m.month }}">
+                  <span class="savings-chevron" aria-hidden="true">›</span>{{ m.label }}
+                </button>
+              </div>
+            </td>
+            <td class="num pos">{% if m.ins %}+{{ m.ins | eur }}{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td class="num neg">{% if m.outs %}−{{ m.outs | eur }}{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td class="num {% if m.net >= 0 %}pos{% else %}neg{% endif %}">
+              {% if m.net >= 0 %}+{% else %}−{% endif %}{{ m.net | abs | eur }}
+            </td>
+            <td class="num muted">{{ m.tx | length }}</td>
+          </tr>
+          <tr class="savings-detail-row" id="m-{{ m.month }}" hidden>
+            <td colspan="5">
+              <ul class="savings-tx-list">
+                {% for r in m.tx %}
+                  <li class="savings-tx">
+                    <span class="savings-tx-date">{{ r.date }}</span>
+                    <span class="savings-tx-name">
+                      {{ r.name }}
+                      {% if r.notifications %}
+                        <span class="savings-tx-note">{{ r.notifications[:90] }}{% if r.notifications|length > 90 %}…{% endif %}</span>
+                      {% endif %}
+                    </span>
+                    <span class="num savings-tx-amt {% if r.direction == 'Debit' %}pos{% else %}neg{% endif %}">
+                      {% if r.direction == 'Debit' %}+{% else %}−{% endif %}{{ r.amount | eur }}
+                    </span>
+                  </li>
+                {% endfor %}
+              </ul>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p class="savings-legend muted small">
+    <strong>Toegevoegd</strong> is geld dat naar je spaarrekening is gegaan; <strong>Opgenomen</strong> is geld dat terug naar je betaalrekening is gehaald. Klik op een maand om de transacties te zien.
+  </p>
+
+{% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  document.querySelectorAll('.savings-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const row = btn.closest('tr');
+      const detail = document.getElementById(btn.getAttribute('aria-controls'));
+      const open = btn.getAttribute('aria-expanded') === 'true';
+      btn.setAttribute('aria-expanded', String(!open));
+      row.classList.toggle('is-open', !open);
+      if (open) { detail.setAttribute('hidden', ''); } else { detail.removeAttribute('hidden'); }
+    });
+  });
+</script>
+{% endblock %}
+</content>
+</invoke>

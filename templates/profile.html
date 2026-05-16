@@ -1,0 +1,217 @@
+{% extends "base.html" %}
+{% block title %}Profiel · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="profile-page">
+  <div class="page-head">
+    <h1 class="page-title">Profiel</h1>
+  </div>
+
+  <div class="profile-row">
+    <div class="profile-avatar profile-avatar-lg" aria-hidden="true">
+      {% set initial = (current_user.name or current_user.email or '?')[:1] | upper %}
+      <span>{{ initial }}</span>
+    </div>
+    <div class="profile-meta">
+      <div class="profile-name">{{ current_user.name }}</div>
+      <div class="profile-email muted">{{ current_user.email }}</div>
+    </div>
+  </div>
+
+  <div class="profile-grid-top">
+    <section class="profile-section">
+      <h2 class="profile-section-title">Gemini API-sleutel</h2>
+      <p class="profile-section-hint muted">
+        Wordt gebruikt door de AI-samenvatting op de Diagnostiek-pagina. Alleen
+        in deze browser opgeslagen — wordt nooit naar de server gestuurd behalve
+        bij het genereren van een samenvatting.
+      </p>
+      <div class="profile-apikey-row">
+        <input type="password"
+               id="profileApiKey"
+               class="ai-summary-key profile-apikey-input"
+               placeholder="Plak hier je Gemini API-sleutel"
+               autocomplete="off"
+               spellcheck="false"
+               aria-label="Gemini API-sleutel">
+        <button type="button" id="profileApiKeyClear" class="btn">Wissen</button>
+      </div>
+      <p id="profileApiKeyStatus" class="profile-apikey-status muted small"></p>
+    </section>
+
+    <section class="profile-section">
+      <h2 class="profile-section-title">AI-samenvattingen automatisch genereren</h2>
+      <p class="profile-section-hint muted">
+        Wanneer de Diagnostiek-periode volledig is gecategoriseerd (geen
+        ongecategoriseerde transacties), worden de drie AI-kaarten automatisch
+        één keer per sessie gegenereerd bij het laden van de pagina. Schakel uit
+        als je liever zelf op Genereren klikt.
+      </p>
+      <div class="profile-toggle-row">
+        <label class="profile-toggle">
+          <input type="checkbox"
+                 id="profileAutoGenerate"
+                 {% if auto_generate_ai %}checked{% endif %}>
+          <span>Genereer de drie kaarten automatisch bij een schone periode</span>
+        </label>
+      </div>
+      <p id="profileAutoGenerateStatus" class="profile-apikey-status muted small"></p>
+    </section>
+  </div>
+
+  <section class="profile-section">
+    <h2 class="profile-section-title">Doelen</h2>
+    <p class="profile-section-hint muted">
+      Kies de richting waarin de Advies-kaart op Diagnostiek je wilt sturen.
+      Doelen zijn vast ingebouwd; het actieve doel wordt meegestuurd met de
+      Advies-payload zodat het model aanbevelingen daar omheen kan formuleren.
+    </p>
+    <div class="goal-list" id="goalList">
+      {% for goal_id, goal in goals.items() %}
+        <button type="button"
+                class="goal-card{% if goal_id == active_goal_id %} goal-card-active{% endif %}"
+                data-goal-id="{{ goal_id }}"
+                aria-pressed="{% if goal_id == active_goal_id %}true{% else %}false{% endif %}">
+          <span class="goal-card-check" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="22" height="22">
+              <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/>
+              <path d="M7 12.5l3.2 3.2L17 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <span class="goal-card-title">{{ goal.title }}</span>
+          <span class="goal-card-desc">{{ goal.description }}</span>
+        </button>
+      {% endfor %}
+    </div>
+    <p id="goalStatus" class="profile-apikey-status muted small"></p>
+  </section>
+
+  <form method="post" action="{{ url_for('logout') }}" class="profile-actions">
+    <button type="submit" class="btn btn-ghost">Uitloggen</button>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    const input = document.getElementById('profileApiKey');
+    const clearBtn = document.getElementById('profileApiKeyClear');
+    const status = document.getElementById('profileApiKeyStatus');
+    if (!input || !clearBtn || !status) return;
+
+    const KEY_STORAGE = 'aiSummaryKey';
+
+    function readSaved() {
+      try { return localStorage.getItem(KEY_STORAGE) || ''; } catch (e) { return ''; }
+    }
+    function setStatus(text) { status.textContent = text; }
+
+    const initial = readSaved();
+    input.value = initial;
+    setStatus(initial ? 'Opgeslagen in deze browser.' : 'Geen sleutel opgeslagen.');
+
+    let saveTimer = null;
+    input.addEventListener('input', () => {
+      clearTimeout(saveTimer);
+      setStatus('Opslaan…');
+      saveTimer = setTimeout(() => {
+        try {
+          if (input.value) {
+            localStorage.setItem(KEY_STORAGE, input.value);
+            setStatus('Opgeslagen in deze browser.');
+          } else {
+            localStorage.removeItem(KEY_STORAGE);
+            setStatus('Geen sleutel opgeslagen.');
+          }
+        } catch (e) {
+          setStatus('Kon niet opslaan — localStorage niet beschikbaar.');
+        }
+      }, 250);
+    });
+
+    clearBtn.addEventListener('click', () => {
+      input.value = '';
+      try { localStorage.removeItem(KEY_STORAGE); } catch (e) { /* ignore */ }
+      setStatus('Geen sleutel opgeslagen.');
+      input.focus();
+    });
+  })();
+
+  // Auto-generate toggle — posts the new state to the server on change.
+  (function () {
+    const checkbox = document.getElementById('profileAutoGenerate');
+    const status = document.getElementById('profileAutoGenerateStatus');
+    if (!checkbox || !status) return;
+
+    function setStatus(text, cls) {
+      status.textContent = text;
+      status.className = 'profile-apikey-status muted small' + (cls ? ' ' + cls : '');
+    }
+    setStatus(checkbox.checked ? 'Aan — wordt één keer per periode geactiveerd wanneer ongecategoriseerd = 0.' : 'Uit — genereer handmatig met de knop Genereren.');
+
+    checkbox.addEventListener('change', async () => {
+      const enabled = checkbox.checked;
+      setStatus('Opslaan…');
+      try {
+        const r = await fetch('{{ url_for("api_profile_auto_generate") }}', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        const data = await r.json();
+        if (!r.ok || !data.ok) {
+          setStatus(data.error || ('Opslaan mislukt (HTTP ' + r.status + ').'), 'ai-summary-error');
+          // Revert the visible state so the toggle matches the server.
+          checkbox.checked = !enabled;
+          return;
+        }
+        setStatus(enabled ? 'Aan — wordt één keer per periode geactiveerd wanneer ongecategoriseerd = 0.' : 'Uit — genereer handmatig met de knop Genereren.');
+      } catch (e) {
+        setStatus('Opslaan mislukt: ' + e.message, 'ai-summary-error');
+        checkbox.checked = !enabled;
+      }
+    });
+  })();
+
+  // Goal selection — clicking a card sets it active and posts to the server.
+  (function () {
+    const list = document.getElementById('goalList');
+    const status = document.getElementById('goalStatus');
+    if (!list || !status) return;
+
+    function setStatus(text, cls) {
+      status.textContent = text;
+      status.className = 'profile-apikey-status muted small' + (cls ? ' ' + cls : '');
+    }
+
+    list.addEventListener('click', async (ev) => {
+      const card = ev.target.closest('.goal-card');
+      if (!card || card.classList.contains('goal-card-active')) return;
+      const goalId = card.getAttribute('data-goal-id');
+      if (!goalId) return;
+      setStatus('Opslaan…');
+      try {
+        const r = await fetch('{{ url_for("api_profile_active_goal") }}', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal_id: goalId }),
+        });
+        const data = await r.json();
+        if (!r.ok || !data.ok) {
+          setStatus(data.error || ('Opslaan mislukt (HTTP ' + r.status + ').'), 'ai-summary-error');
+          return;
+        }
+        list.querySelectorAll('.goal-card').forEach(el => {
+          const isActive = el === card;
+          el.classList.toggle('goal-card-active', isActive);
+          el.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+        });
+        setStatus('Actief doel: ' + (card.querySelector('.goal-card-title').textContent || goalId) + '.');
+      } catch (e) {
+        setStatus('Opslaan mislukt: ' + e.message, 'ai-summary-error');
+      }
+    });
+  })();
+</script>
+{% endblock %}

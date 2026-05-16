@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Regels · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="tx-layout">
+  <aside class="tx-side">
+    <form method="post" class="rule-form filters">
+      <input type="hidden" name="action" value="create">
+      <h3 class="rules-side-title">Regel toevoegen</h3>
+      <p class="muted small rules-side-hint">Een regel kent automatisch een categorie toe wanneer het gekozen veld overeenkomt met het patroon (niet hoofdlettergevoelig). Kies <em>Bevat</em> voor matches ergens in de tekst zoals "disney" of "spotify", of <em>Alleen heel woord</em> voor strengere matches op woordgrenzen.</p>
+      <div class="rule-filter">
+        <input type="text" name="pattern" placeholder="Patroon (bijv. 'Albert Heijn')" required
+               value="{{ prefill_pattern or '' }}"{% if prefill_pattern %} autofocus{% endif %}>
+        <select name="field">
+          <option value="name"{% if prefill_field == 'name' %} selected{% endif %}>Naam</option>
+          <option value="counterparty"{% if prefill_field == 'counterparty' %} selected{% endif %}>Tegenpartij</option>
+          <option value="notifications"{% if prefill_field == 'notifications' %} selected{% endif %}>Notificaties</option>
+        </select>
+        <select name="category_id" class="cat-rule-select" data-cd-skip required>
+          <option value="">Categorie…</option>
+          {% for c in categories %}
+            <option value="{{ c.id }}">{{ c.name }}</option>
+          {% endfor %}
+        </select>
+        <div class="data-list" data-picker-topics='{{ picker_topics | tojson }}' hidden></div>
+      </div>
+      <div class="rule-filter rule-conditions">
+        <div class="rule-mode-toggle" role="radiogroup" aria-label="Matchmodus">
+          <label class="rule-mode-opt" title="Patroon mag overal in het veld voorkomen — 'disney' matcht 'Disney+ Subscription'.">
+            <input type="radio" name="word_boundary" value="0" checked>
+            <span class="rule-mode-pill">Bevat</span>
+          </label>
+          <label class="rule-mode-opt" title="Patroon moet op woordgrenzen matchen — 'AH' matcht niet met 'BAHN' of 'SHAH'.">
+            <input type="radio" name="word_boundary" value="1">
+            <span class="rule-mode-pill">Alleen heel woord</span>
+          </label>
+        </div>
+        <span class="rule-opt amount-range">
+          <span class="rule-opt-label">Bedrag €</span>
+          <input type="text" name="amount_min" inputmode="decimal" placeholder="min" class="amount-input">
+          <span class="muted">t/m</span>
+          <input type="text" name="amount_max" inputmode="decimal" placeholder="max" class="amount-input">
+        </span>
+        <button type="button" class="btn btn-ghost rule-preview-btn">Voorbeeld</button>
+        <button class="btn btn-primary">Regel toevoegen</button>
+      </div>
+      <div class="rule-preview-result" hidden></div>
+    </form>
+  </aside>
+
+  <main class="tx-main">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">Auto-sorteerregels</h1>
+      </div>
+      <form method="post" class="inline-form">
+        <input type="hidden" name="action" value="rerun">
+        <button class="btn">Opnieuw uitvoeren op ongecategoriseerd</button>
+      </form>
+    </div>
+
+    <div class="card table-card">
+      <table class="data-table">
+        <thead>
+          <tr><th>Patroon</th><th>Veld</th><th>Categorie</th><th class="num">Treffers</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for r in rules %}
+          <tr>
+            <td>
+              <code>{{ r.pattern }}</code>
+              {% if r.word_boundary %}<span class="rule-flag" title="Match op heel woord">woord</span>{% endif %}
+              {% if r.amount_min is not none or r.amount_max is not none %}
+                <span class="rule-flag" title="Bedrag {{ '%.2f'|format(r.amount_min) if r.amount_min is not none else '−∞' }} t/m {{ '%.2f'|format(r.amount_max) if r.amount_max is not none else '+∞' }}">€</span>
+              {% endif %}
+            </td>
+            <td class="muted">{{ {'name': 'naam', 'counterparty': 'tegenpartij', 'notifications': 'notificaties'}.get(r.field, r.field) }}</td>
+            <td>
+              {% if r.category_name %}
+                <span class="cat"><span class="dot" style="background: {{ r.category_color }};"></span>{{ r.category_name }}</span>
+              {% endif %}
+            </td>
+            <td class="num">{{ r.hits }}</td>
+            <td class="num">
+              <form method="post" class="inline-form">
+                <input type="hidden" name="action" value="delete">
+                <input type="hidden" name="id" value="{{ r.id }}">
+                <button class="btn btn-ghost">Verwijderen</button>
+              </form>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="empty">Nog geen regels. Vink "Vast" aan tijdens categoriseren om er een aan te maken.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</div>
+{% endblock %}
