@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 from calendar import monthrange
 from datetime import datetime, date
 from collections import defaultdict, Counter
@@ -17,6 +18,7 @@ from flask import (
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import init_db, get_connection
+import llm_categorize
 
 
 # PyInstaller --onefile unpacks templates/ and static/ into a temp dir exposed
@@ -92,6 +94,50 @@ def parse_amount(s):
     return float(str(s).replace(".", "").replace(",", ".")) if "," in str(s) else float(s)
 
 
+def parse_amount_query(q):
+    """Interpret a search term as an amount. Returns (low, high) or None.
+
+    Amounts are stored unsigned — `direction` carries the sign — so a leading
+    minus is dropped rather than used to filter: typing "-12,50" finds the
+    €12,50 expense, which is what someone reading a statement means.
+
+        "12,50" / "12.50"  -> that exact amount (float tolerance)
+        "1.234,56"         -> Dutch thousands separator, exact
+        "12"               -> the whole-euro band 12,00-12,99
+
+    Whole numbers match a band because "12" in a search box means "about
+    twelve euros", not "exactly twelve euros and zero cents".
+
+    Returns None for anything not purely numeric, so ordinary text searches are
+    unaffected.
+    """
+    s = (q or "").replace("€", "").strip().lstrip("+-").strip()
+    if not s or not re.fullmatch(r"[\d.,]+", s):
+        return None
+
+    if "," in s:
+        # Dutch style: dots group thousands, the comma is the decimal point.
+        whole, _, frac = s.partition(",")
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{3})*|\d+", whole) or not re.fullmatch(r"\d{1,2}", frac):
+            return None
+        value = float(f"{whole.replace('.', '')}.{frac}")
+        return (value - 0.005, value + 0.005)
+
+    if "." in s:
+        whole, _, frac = s.partition(".")
+        # Only a genuine 1-2 digit decimal; "1.234" is ambiguous, so leave it
+        # to the text search rather than guessing thousands vs decimals.
+        if not whole.isdigit() or not re.fullmatch(r"\d{1,2}", frac):
+            return None
+        value = float(f"{whole}.{frac}")
+        return (value - 0.005, value + 0.005)
+
+    if not s.isdigit():
+        return None
+    value = float(s)
+    return (value, value + 1.0)
+
+
 def parse_date(s):
     s = (s or "").strip()
     if len(s) == 8 and s.isdigit():
@@ -122,13 +168,22 @@ def format_month_label(ym: str) -> str:
 # ---------- bank format detection ----------
 
 ING_REQUIRED = {"Date", "Name / Description", "Amount (EUR)"}
+# ING also exports in Dutch, comma-delimited, without the balance/tag columns.
+# Same bank, same account, different download button — so it needs its own
+# mapping rather than being treated as a broken file.
+ING_NL_REQUIRED = {"Datum", "Naam / Omschrijving", "Bedrag (EUR)"}
 ASN_REQUIRED = {"Datum", "Bedrag bij / af", "Omschrijving"}
+
+# Delimiters to try, in order. ING English uses ';', ING Dutch uses ','.
+CSV_DELIMITERS = (";", ",")
 
 
 def detect_format(fieldnames):
     fields = set(fieldnames or [])
     if ING_REQUIRED.issubset(fields):
         return "ing"
+    if ING_NL_REQUIRED.issubset(fields):
+        return "ing_nl"
     if ASN_REQUIRED.issubset(fields):
         return "asn"
     return None
@@ -155,6 +210,38 @@ def extract_ing(row):
         "transaction_type": (row.get("Transaction type") or "").strip(),
         "notifications": (row.get("Notifications") or "").strip(),
         "balance": parse_amount(row.get("Resulting balance")),
+        "tag": (row.get("Tag") or "").strip(),
+    }
+
+
+def extract_ing_nl(row):
+    """ING's Dutch export. Same data as extract_ing under different headers.
+
+    Two things differ beyond the names: direction is 'Af'/'Bij' rather than
+    'Debit'/'Credit', and the balance and tag columns are absent entirely, so
+    both come back empty. `Mutatiesoort` keeps its Dutch wording — it is
+    descriptive only, and inventing a translation would be guessing.
+    """
+    af_bij = (row.get("Af Bij") or "").strip().lower()
+    if af_bij == "af":
+        direction = "Debit"
+    elif af_bij == "bij":
+        direction = "Credit"
+    else:
+        direction = ""
+
+    return {
+        "date": parse_date(row.get("Datum")),
+        "name": (row.get("Naam / Omschrijving") or "").strip(),
+        "account": (row.get("Rekening") or "").strip(),
+        "counterparty": (row.get("Tegenrekening") or "").strip(),
+        "code": (row.get("Code") or "").strip(),
+        "direction": direction,
+        "amount": parse_amount(row.get("Bedrag (EUR)")),
+        "transaction_type": (row.get("Mutatiesoort") or "").strip(),
+        "notifications": (row.get("Mededelingen") or "").strip(),
+        # Not present in this export; parse_amount(None) is None.
+        "balance": parse_amount(row.get("Saldo na mutatie")),
         "tag": (row.get("Tag") or "").strip(),
     }
 
@@ -195,7 +282,7 @@ def extract_asn(row):
     }
 
 
-EXTRACTORS = {"ing": extract_ing, "asn": extract_asn}
+EXTRACTORS = {"ing": extract_ing, "ing_nl": extract_ing_nl, "asn": extract_asn}
 
 
 CARD_PREFIX_RE = re.compile(r"^[A-Z]{2,5}\*")
@@ -269,6 +356,13 @@ def _row_get(row, key, default=None):
     except (AttributeError, IndexError):
         pass
     return default
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcards so user text matches literally. The rule engine
+    (_rule_matches) does plain substring containment, so any SQL LIKE that
+    mirrors it must neutralize %/_ — pair with ESCAPE '\\' in the query."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _parse_optional_amount(v):
@@ -809,6 +903,128 @@ def suggest_categories_for_rows(conn, uncat_rows):
     return out
 
 
+# ---------- suggestion engine (local model, tier 3) ----------
+# Only ever consulted for rows tiers 1 and 2 could not place. Results are
+# cached per merchant key, never auto-applied, and stop being asked for once
+# accepted rows give the history suggester enough samples to take over.
+
+def _llm_suggestion_key(row):
+    """(scope, key) this row is cached and grouped under.
+
+    Prefers the same merchant key the history suggester groups on, so a guess
+    made for 'albert heijn' covers every future Albert Heijn row. Falls back to
+    the counterparty, then to the row itself for one-offs that generalize to
+    nothing.
+    """
+    mk = _merchant_key(_row_get(row, "name") or "")
+    if mk:
+        return ("merchant", mk)
+    cp = (_row_get(row, "counterparty") or "").strip()
+    if cp:
+        return ("counterparty", cp.lower())
+    return ("tx", str(_row_get(row, "id")))
+
+
+def _llm_signal_key(scope, key):
+    """Flatten (scope, key) into the single signal_key the corrections table stores."""
+    return f"{scope}:{key}"
+
+
+def _llm_rejected_pairs(conn):
+    """{(signal_key, category_id)} the user has already rejected for this tier.
+
+    The history tier needs two rejections before it suppresses, because its
+    evidence is statistical and one disagreement may be noise. A local-model
+    guess is a definite claim, so one rejection is enough — re-proposing it
+    would just be nagging. A *different* category for the same merchant is
+    still allowed through on a later sweep.
+    """
+    try:
+        rows = conn.execute(
+            """SELECT signal_key, suggested_category_id
+               FROM corrections
+               WHERE signal_source = 'llm'
+                 AND signal_key IS NOT NULL
+                 AND suggested_category_id IS NOT NULL"""
+        ).fetchall()
+    except Exception:
+        return set()
+    return {(r["signal_key"], r["suggested_category_id"]) for r in rows}
+
+
+def _load_llm_suggestions(conn, rows):
+    """Stored local-model guesses for `rows`, keyed by tx id.
+
+    Returns the same dict shape suggest_categories_for_rows produces, so the
+    template and the Accept/Reject handlers need no special-casing — only the
+    extra `confidence`/`reason` fields, which drive the badge tooltip.
+    """
+    if not rows:
+        return {}
+    try:
+        cached = conn.execute(
+            """SELECT s.scope, s.key, s.category_id, s.confidence, s.reason, s.model,
+                      c.name AS category_name,
+                      COALESCE(c.color, tp.color, '#94a3b8') AS category_color
+               FROM llm_suggestions s
+               JOIN categories c ON c.id = s.category_id
+               LEFT JOIN topics tp ON tp.id = c.topic_id"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    if not cached:
+        return {}
+
+    by_key = {(r["scope"], r["key"]): r for r in cached}
+    rejected = _llm_rejected_pairs(conn)
+
+    out = {}
+    for tx in rows:
+        scope, key = _llm_suggestion_key(tx)
+        hit = by_key.get((scope, key))
+        if not hit:
+            continue
+        signal_key = _llm_signal_key(scope, key)
+        if (signal_key, hit["category_id"]) in rejected:
+            continue
+        out[tx["id"]] = {
+            "category_id": hit["category_id"],
+            "category_name": hit["category_name"],
+            "category_color": hit["category_color"],
+            "sample_count": 0,
+            "source": "llm",
+            "tier": "SUGGEST",
+            "signals": ["local_model"],
+            "signal_source": "llm",
+            "signal_key": signal_key,
+            "confidence": hit["confidence"],
+            "reason": hit["reason"],
+            "model": hit["model"],
+        }
+    return out
+
+
+def _get_user_llm_settings(conn, user_id):
+    """Local-model settings for the user, with defaults for a missing row."""
+    defaults = {"enabled": False, "model": "", "url": llm_categorize.DEFAULT_URL}
+    if not user_id:
+        return defaults
+    try:
+        row = conn.execute(
+            "SELECT llm_enabled, llm_model, llm_url FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return defaults
+    if not row:
+        return defaults
+    return {
+        "enabled": bool(row["llm_enabled"]),
+        "model": (row["llm_model"] or "").strip(),
+        "url": (row["llm_url"] or "").strip() or llm_categorize.DEFAULT_URL,
+    }
+
+
 # ---------- routes ----------
 
 @app.route("/")
@@ -929,11 +1145,13 @@ def profile():
     with get_connection() as conn:
         active_goal_id = _get_user_active_goal_id(conn, user_id)
         auto_generate_ai = _get_user_auto_generate(conn, user_id)
+        llm = _get_user_llm_settings(conn, user_id)
     return render_template(
         "profile.html",
         goals=GOALS,
         active_goal_id=active_goal_id,
         auto_generate_ai=auto_generate_ai,
+        llm=llm,
     )
 
 
@@ -974,6 +1192,319 @@ def api_profile_auto_generate():
     return jsonify({"ok": True, "enabled": bool(enabled)})
 
 
+@app.route("/api/profile/llm", methods=["POST"])
+def api_profile_llm():
+    """Persist the local-model settings (enabled / model tag / Ollama URL)."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Niet ingelogd."}), 401
+    body = request.get_json(silent=True) or {}
+
+    enabled = 1 if bool(body.get("enabled")) else 0
+    model = (body.get("model") or "").strip()
+    url = (body.get("url") or "").strip() or llm_categorize.DEFAULT_URL
+
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return jsonify({"error": "URL moet met http:// of https:// beginnen."}), 400
+    # Enabled-without-a-model is a valid intermediate state: it's what puts the
+    # download button on the Transactions page, which is where a new user is
+    # told a model is missing and offered one in the same click.
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET llm_enabled = ?, llm_model = ?, llm_url = ? WHERE id = ?",
+            (enabled, model, url, user["id"]),
+        )
+        conn.commit()
+    return jsonify({"ok": True, "enabled": bool(enabled), "model": model, "url": url})
+
+
+# ---------- model download ----------
+# A pull is multi-GB and takes minutes, so it runs on a background thread and
+# the client polls for progress. Flask serves threaded by default, so the poll
+# is answered while the download is still streaming.
+
+_PULL_LOCK = threading.Lock()
+_PULL_STATE = {
+    "active": False, "model": None, "phase": "", "percent": 0,
+    "done": False, "error": None,
+}
+
+
+def _pull_worker(model, url, user_id):
+    """Stream the download, then wire the model up so the user is done."""
+    def on_progress(msg):
+        phase = str(msg.get("status") or "")
+        total = msg.get("total") or 0
+        completed = msg.get("completed") or 0
+        with _PULL_LOCK:
+            _PULL_STATE["phase"] = phase
+            if total:
+                _PULL_STATE["percent"] = int(completed / total * 100)
+
+    try:
+        llm_categorize.pull_model(model, url, on_progress=on_progress)
+    except llm_categorize.OllamaError as e:
+        with _PULL_LOCK:
+            _PULL_STATE.update(active=False, done=True, error=str(e))
+        return
+    except Exception as e:  # defensive: a worker thread must never die silently
+        with _PULL_LOCK:
+            _PULL_STATE.update(active=False, done=True,
+                               error=f"{e.__class__.__name__}: {e}")
+        return
+
+    # Select the model we just downloaded and switch the feature on, so the
+    # download is the whole setup step rather than the first of three.
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE users SET llm_model = ?, llm_enabled = 1 WHERE id = ?",
+                (model, user_id),
+            )
+            conn.commit()
+    except Exception as e:
+        with _PULL_LOCK:
+            _PULL_STATE.update(active=False, done=True,
+                               error=f"Model gedownload, maar opslaan mislukte: {e}")
+        return
+
+    with _PULL_LOCK:
+        _PULL_STATE.update(active=False, done=True, percent=100,
+                           phase="klaar", error=None)
+
+
+@app.route("/api/llm/pull", methods=["POST"])
+def api_llm_pull_start():
+    """Start downloading a model. Returns immediately; poll the GET for progress."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Niet ingelogd."}), 401
+
+    body = request.get_json(silent=True) or {}
+    model = (body.get("model") or "").strip()
+
+    with get_connection() as conn:
+        settings = _get_user_llm_settings(conn, user["id"])
+    url = settings["url"]
+
+    if not model:
+        model = llm_categorize.recommend_model()["model"]
+
+    # Claim the slot before probing: checking and then setting under separate
+    # lock acquisitions would let two concurrent clicks both start a download,
+    # and probing first would report an unreachable daemon when the real reason
+    # is that a pull is already running.
+    with _PULL_LOCK:
+        if _PULL_STATE["active"]:
+            return jsonify({"error": "Er loopt al een download.",
+                            "model": _PULL_STATE["model"]}), 409
+        _PULL_STATE.update(active=True, model=model, phase="starten…",
+                           percent=0, done=False, error=None)
+
+    reachable = llm_categorize.probe(url)
+    if not reachable["ok"]:
+        with _PULL_LOCK:
+            _PULL_STATE.update(active=False, done=True, error=reachable["error"])
+        return jsonify({"error": reachable["error"]}), 503
+
+    threading.Thread(
+        target=_pull_worker, args=(model, url, user["id"]), daemon=True
+    ).start()
+    return jsonify({"ok": True, "model": model}), 202
+
+
+@app.route("/api/llm/pull")
+def api_llm_pull_status():
+    """Progress of the running (or last) download."""
+    if not _current_user():
+        return jsonify({"error": "Niet ingelogd."}), 401
+    with _PULL_LOCK:
+        return jsonify(dict(_PULL_STATE))
+
+
+@app.route("/api/profile/llm/probe")
+def api_profile_llm_probe():
+    """Is Ollama reachable, and which models are installed?
+
+    Used to populate the model picker and by the 'test connection' button. A
+    down daemon is a normal answer here, not an error — the feature is designed
+    to be entirely absent rather than broken when Ollama isn't running.
+    """
+    if not _current_user():
+        return jsonify({"error": "Niet ingelogd."}), 401
+    url = (request.args.get("url") or "").strip() or llm_categorize.DEFAULT_URL
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return jsonify({"ok": False, "models": [], "error": "Ongeldige URL."})
+    result = llm_categorize.probe(url)
+    # Carried alongside the model list so the UI can offer a download without a
+    # second round trip when nothing is installed yet.
+    result["recommended"] = llm_categorize.recommend_model(result.get("vram_mb"))
+    return jsonify(result)
+
+
+# How many distinct merchant keys one sweep request handles. The client loops
+# until done, which keeps each request short (Flask's dev server handles one at
+# a time) and gives the progress bar something to move on.
+LLM_SWEEP_BATCH = 6
+
+
+@app.route("/api/categorize/llm", methods=["POST"])
+def api_categorize_llm():
+    """Ask the local model about uncategorized rows that tiers 1 and 2 can't place.
+
+    Deduplicates by merchant key first, so a backlog of 26 rows across 19 names
+    costs roughly 15 model calls, not 26 — and the answers are cached, so future
+    rows from those merchants cost nothing.
+
+    Returns progress counters; the client re-POSTs until `done`.
+    """
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Niet ingelogd."}), 401
+
+    body = request.get_json(silent=True) or {}
+    limit = body.get("limit")
+    try:
+        limit = max(1, min(int(limit), 25)) if limit is not None else LLM_SWEEP_BATCH
+    except (TypeError, ValueError):
+        limit = LLM_SWEEP_BATCH
+    force = bool(body.get("force"))
+
+    with get_connection() as conn:
+        settings = _get_user_llm_settings(conn, user["id"])
+        if not settings["enabled"] or not settings["model"]:
+            return jsonify({
+                "error": "Lokaal model staat uit. Zet het aan bij Profiel en kies een model."
+            }), 409
+
+        # The configured model can vanish from under us — a failed pull that
+        # never finalized, or `ollama rm`. Detect it here and clear the setting
+        # so the UI falls back to offering a download, rather than leaving the
+        # user with a sweep button that 404s every time they press it.
+        reachable = llm_categorize.probe(settings["url"])
+        if reachable["ok"]:
+            installed = {m["name"] for m in reachable["models"]}
+            if settings["model"] not in installed:
+                conn.execute(
+                    "UPDATE users SET llm_model = '' WHERE id = ?", (user["id"],)
+                )
+                conn.commit()
+                return jsonify({
+                    "error": f"{settings['model']} staat niet in Ollama — de download is "
+                             f"waarschijnlijk niet afgerond. Herlaad de pagina; "
+                             f"je krijgt dan weer een downloadknop.",
+                    "model_missing": True,
+                }), 409
+
+        rows = conn.execute(
+            """SELECT id, name, counterparty, code, transaction_type,
+                      direction, amount, notifications
+               FROM transactions
+               WHERE category_id IS NULL AND match_parent_id IS NULL
+               ORDER BY date DESC, id DESC"""
+        ).fetchall()
+        if not rows:
+            return jsonify({"done": True, "processed": 0, "stored": 0,
+                            "abstained": 0, "remaining": 0, "message": "Niets te doen."})
+
+        # Don't spend model calls on rows the history tier already answers —
+        # its evidence is this user's own behaviour and outranks a guess.
+        history_hits = suggest_categories_for_rows(conn, rows)
+
+        # One representative row per key. Rows arrive newest-first, so the
+        # representative carries the merchant string the bank currently emits.
+        pending = {}
+        for r in rows:
+            if r["id"] in history_hits:
+                continue
+            k = _llm_suggestion_key(r)
+            if k not in pending:
+                pending[k] = r
+
+        if not force:
+            done_keys = {
+                (s["scope"], s["key"])
+                for s in conn.execute("SELECT scope, key FROM llm_suggestions").fetchall()
+            }
+            pending = {k: v for k, v in pending.items() if k not in done_keys}
+
+        total_pending = len(pending)
+        if total_pending == 0:
+            return jsonify({"done": True, "processed": 0, "stored": 0, "abstained": 0,
+                            "remaining": 0, "message": "Alle openstaande transacties zijn al beoordeeld."})
+
+        try:
+            context = llm_categorize.build_context(conn)
+        except llm_categorize.OllamaError as e:
+            return jsonify({"error": str(e)}), 400
+
+        rejected = _llm_rejected_pairs(conn)
+        batch = list(pending.items())[:limit]
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        stored = abstained = 0
+
+        for (scope, key), row in batch:
+            try:
+                result = llm_categorize.classify(
+                    context, row, settings["model"], settings["url"]
+                )
+            except llm_categorize.OllamaError as e:
+                # Transport-level failure: stop and report honestly rather than
+                # burning through the rest of the batch hitting the same wall.
+                conn.commit()
+                return jsonify({
+                    "error": str(e),
+                    "processed": stored + abstained,
+                    "stored": stored,
+                    "abstained": abstained,
+                    "remaining": total_pending - (stored + abstained),
+                    "done": False,
+                }), 502
+
+            if result is None or (_llm_signal_key(scope, key), result["category_id"]) in rejected:
+                # Abstention is a real answer. Record it so the sweep doesn't
+                # re-ask the same unanswerable row on every run; a NULL
+                # category_id never renders as a suggestion.
+                abstained += 1
+                conn.execute(
+                    """INSERT INTO llm_suggestions
+                         (scope, key, category_id, confidence, reason, model, created_at)
+                       VALUES (?, ?, NULL, NULL, NULL, ?, ?)
+                       ON CONFLICT(scope, key) DO UPDATE SET
+                         category_id = NULL, confidence = NULL, reason = NULL,
+                         model = excluded.model, created_at = excluded.created_at""",
+                    (scope, key, settings["model"], now),
+                )
+                continue
+
+            stored += 1
+            conn.execute(
+                """INSERT INTO llm_suggestions
+                     (scope, key, category_id, confidence, reason, model, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(scope, key) DO UPDATE SET
+                     category_id = excluded.category_id,
+                     confidence  = excluded.confidence,
+                     reason      = excluded.reason,
+                     model       = excluded.model,
+                     created_at  = excluded.created_at""",
+                (scope, key, result["category_id"], result["confidence"],
+                 result["reason"], settings["model"], now),
+            )
+
+        conn.commit()
+
+    remaining = total_pending - len(batch)
+    return jsonify({
+        "done": remaining <= 0,
+        "processed": len(batch),
+        "stored": stored,
+        "abstained": abstained,
+        "remaining": remaining,
+    })
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
     file = request.files.get("file")
@@ -993,11 +1524,28 @@ def upload():
         flash("Bestand kon niet worden gedecodeerd. Sla het op als UTF-8.", "error")
         return redirect(url_for("transactions"))
 
-    reader = csv.DictReader(io.StringIO(text), delimiter=";")
-    fmt = detect_format(reader.fieldnames)
+    # Try each delimiter and keep the one that yields a format we recognise —
+    # ING exports semicolon-delimited in English and comma-delimited in Dutch,
+    # and the file itself gives no other clue which you were handed.
+    reader = None
+    fmt = None
+    seen_headers = []
+    for delimiter in CSV_DELIMITERS:
+        candidate = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+        headers = candidate.fieldnames
+        seen_headers.append((delimiter, headers))
+        detected = detect_format(headers)
+        if detected:
+            reader, fmt = candidate, detected
+            break
+
     if fmt is None:
+        # Report the split that found the most columns — that's the delimiter the
+        # file actually uses, so the listed headers are the useful ones to see.
+        best = max(seen_headers, key=lambda h: len(h[1] or []))
         flash(
-            f"Onbekend CSV-formaat. Verwacht een ING- of ASN-export. Gevonden kolommen: {reader.fieldnames}",
+            "Onbekend CSV-formaat. Verwacht een ING- of ASN-export. "
+            f"Gevonden kolommen: {best[1]}",
             "error",
         )
         return redirect(url_for("transactions"))
@@ -1109,7 +1657,11 @@ def upload():
 def transactions():
     month = request.args.get("month") or ""
     salary_period = request.args.get("salary_period") or ""
-    category = request.args.get("category") or ""
+    # Category filter is multi-select: any number of category ids, plus the
+    # special "uncategorized" token. Empty values are ignored.
+    category_values = [c for c in request.args.getlist("category") if c]
+    selected_cat_ids = [c for c in category_values if c.isdigit()]
+    selected_uncat = "uncategorized" in category_values
     only_uncat = request.args.get("uncategorized") == "1"
     q = (request.args.get("q") or "").strip()
     direction = (request.args.get("direction") or "").strip().lower()
@@ -1139,15 +1691,37 @@ def transactions():
     if month:
         where.append("substr(t.date, 1, 7) = ?")
         params.append(month)
-    if category == "uncategorized" or only_uncat:
+    if only_uncat:
         where.append("t.category_id IS NULL")
-    elif category:
-        where.append("t.category_id = ?")
-        params.append(int(category))
+    else:
+        # Combine selected categories (OR) with an optional "uncategorized"
+        # bucket, e.g. Salary + Transportation, or Transportation + no-category.
+        cat_clauses = []
+        if selected_cat_ids:
+            placeholders = ",".join("?" * len(selected_cat_ids))
+            cat_clauses.append(f"t.category_id IN ({placeholders})")
+            params.extend(int(c) for c in selected_cat_ids)
+        if selected_uncat:
+            cat_clauses.append("t.category_id IS NULL")
+        if cat_clauses:
+            where.append("(" + " OR ".join(cat_clauses) + ")")
     if q:
-        where.append("(LOWER(t.name) LIKE ? OR LOWER(t.counterparty) LIKE ? OR LOWER(t.notifications) LIKE ?)")
-        like = f"%{q.lower()}%"
-        params.extend([like, like, like])
+        # A purely numeric term is an amount search, not a text search. ORing the
+        # two sounded safer but made the feature useless: the notifications field
+        # is full of card sequence numbers, dates and transaction ids, so "10"
+        # matched 54 irrelevant rows for every 4 genuine ~€10 ones. Anything that
+        # isn't a bare number still searches text exactly as before.
+        amount_band = parse_amount_query(q)
+        if amount_band:
+            where.append("(t.amount >= ? AND t.amount < ?)")
+            params.extend(amount_band)
+        else:
+            where.append(
+                "(LOWER(t.name) LIKE ? OR LOWER(t.counterparty) LIKE ? "
+                "OR LOWER(t.notifications) LIKE ?)"
+            )
+            like = f"%{q.lower()}%"
+            params.extend([like, like, like])
 
     # Flow filter — limits to real income, real expenses, or transfer-only rows.
     # Real income/expenses respect the "Exclude from totals" flag on the topic.
@@ -1342,8 +1916,29 @@ def transactions():
         ]
         suggestions = suggest_categories_for_rows(conn, uncat_rows_for_sug)
 
+        # Tier 3 fills the gaps only. History evidence is grounded in what this
+        # user actually did, so it always outranks a model guess — the local
+        # model is consulted for rows history had nothing to say about.
+        llm_hits = _load_llm_suggestions(
+            conn, [r for r in uncat_rows_for_sug if r["id"] not in suggestions]
+        )
+        suggestions.update(llm_hits)
+
+        llm_settings = _get_user_llm_settings(conn, (_current_user() or {}).get("id"))
+
+    # Without a model the button offers to download one instead of sweeping —
+    # so a new machine needs no terminal, just the two clicks.
+    llm_ui = {
+        "enabled": llm_settings["enabled"],
+        "has_model": bool(llm_settings["model"]),
+        "model": llm_settings["model"],
+    }
+    if llm_ui["enabled"] and not llm_ui["has_model"]:
+        llm_ui["recommended"] = llm_categorize.recommend_model()
+
     return render_template(
         "transactions.html",
+        llm_ui=llm_ui,
         rows=rows,
         categories=categories,
         picker_topics=picker_topics,
@@ -1352,7 +1947,8 @@ def transactions():
         selected_month=month,
         selected_month_label=format_month_label(month),
         selected_salary_period=salary_period,
-        selected_category=category,
+        selected_cat_ids=selected_cat_ids,
+        selected_uncat=selected_uncat,
         selected_flow=flow,
         selected_date=date_filter,
         only_uncat=only_uncat,
@@ -1422,7 +2018,10 @@ def set_category(tx_id):
     if signal_source not in (None, "counterparty", "merchant_name", "recurring"):
         signal_source = None
 
-    cat_id = None if raw_cat in (None, "", "null", "none") else int(raw_cat)
+    try:
+        cat_id = None if raw_cat in (None, "", "null", "none") else int(raw_cat)
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid category_id"}), 400
 
     rule_applied_to = 0
     updated_tx_ids = []
@@ -1508,8 +2107,8 @@ def set_category(tx_id):
                 f"""SELECT id FROM transactions
                     WHERE category_id IS NULL
                       AND id != ?
-                      AND LOWER({field}) LIKE ?{band_sql}""",
-                (tx_id, f"%{pattern.lower()}%", *band_params),
+                      AND LOWER({field}) LIKE ? ESCAPE '\\'{band_sql}""",
+                (tx_id, f"%{_escape_like(pattern.lower())}%", *band_params),
             ).fetchall()
             updated_tx_ids = [r["id"] for r in id_rows]
 
@@ -1544,7 +2143,7 @@ def reject_suggestion(tx_id):
     signal_source = (data.get("signal_source") or "").strip() or None
     signal_key = (data.get("signal_key") or "").strip() or None
 
-    if signal_source not in ("counterparty", "merchant_name", "recurring"):
+    if signal_source not in ("counterparty", "merchant_name", "recurring", "llm"):
         return jsonify({"error": "invalid signal_source"}), 400
     if not signal_key:
         return jsonify({"error": "signal_key required"}), 400
@@ -1568,6 +2167,15 @@ def reject_suggestion(tx_id):
                 datetime.utcnow().isoformat(timespec="seconds"),
             ),
         )
+        # Drop the cached local-model guess too. The correction alone would stop
+        # it being served, but leaving the row would make the next sweep think
+        # this key was already handled and never reconsider it.
+        if signal_source == "llm" and ":" in signal_key:
+            scope, _, key = signal_key.partition(":")
+            conn.execute(
+                "DELETE FROM llm_suggestions WHERE scope = ? AND key = ?",
+                (scope, key),
+            )
         conn.commit()
     return jsonify({"ok": True})
 
@@ -1580,20 +2188,6 @@ def reject_suggestion(tx_id):
 
 MATCH_AMOUNT_TOLERANCE = 0.01
 MATCH_DATE_WINDOW_DAYS = 60
-
-
-def _pick_parent(row_a, row_b):
-    """Return (parent, child) — parent MUST be the Debit, child MUST be the
-    Credit. Same-direction pairs aren't allowed: the parent represents the
-    real spend, children are reimbursements that net it down. Returns
-    (None, None) when both rows share a direction so the caller can 400."""
-    a_debit = (row_a["direction"] or "").lower() == "debit"
-    b_debit = (row_b["direction"] or "").lower() == "debit"
-    if a_debit and not b_debit:
-        return row_a, row_b
-    if b_debit and not a_debit:
-        return row_b, row_a
-    return None, None
 
 
 def _row_is_match_eligible(row):
@@ -1677,44 +2271,47 @@ def api_match_candidate(tx_id):
 
 @app.route("/transactions/match", methods=["POST"])
 def match_transactions():
-    """Pair two transactions as parent (Debit) + child (Credit).
+    """Attach a child transaction to a parent (anchor) transaction.
 
-    The Credit row must be totally unmatched. The Debit row can either be
-    unmatched (creates a fresh group) or already a parent (adds another
-    sibling child — partial-reimbursement model with N credits offsetting
-    one debit). Same-direction pairs are rejected with 400.
+    Anchor model: the drop TARGET becomes the parent (the group's leader); the
+    dragged row becomes its child. Direction is irrelevant — a group nets out
+    by signed sum, so it can be N debits under one credit (e.g. transport spends
+    under a travel allowance), N credits under one debit (a spend with refunds),
+    or any mix. The parent's displayed amount is the net remainder, and its sign
+    (+/-) follows that net (see the display builder in the transactions route).
+
+    Rules: the child must be completely unmatched; the parent must not itself be
+    a child of another group. A row can't be matched to itself.
+
+    Accepts parent_id/child_id (preferred) or legacy a_id/b_id, where b_id is
+    treated as the parent (drop target) and a_id as the child (dragged row).
     """
     data = request.get_json(silent=True) or request.form
     try:
-        a_id = int(data.get("a_id"))
-        b_id = int(data.get("b_id"))
+        parent_id = int(data.get("parent_id") if data.get("parent_id") is not None else data.get("b_id"))
+        child_id = int(data.get("child_id") if data.get("child_id") is not None else data.get("a_id"))
     except (TypeError, ValueError):
-        return jsonify({"error": "a_id and b_id required"}), 400
-    if a_id == b_id:
+        return jsonify({"error": "parent_id and child_id required"}), 400
+    if parent_id == child_id:
         return jsonify({"error": "cannot match a row to itself"}), 400
 
     with get_connection() as conn:
         rows = conn.execute(
             """SELECT id, date, amount, direction, is_matched, match_parent_id
                  FROM transactions WHERE id IN (?, ?)""",
-            (a_id, b_id),
+            (parent_id, child_id),
         ).fetchall()
         if len(rows) != 2:
             return jsonify({"error": "transaction not found"}), 404
-        row_a = next(r for r in rows if r["id"] == a_id)
-        row_b = next(r for r in rows if r["id"] == b_id)
+        parent = next(r for r in rows if r["id"] == parent_id)
+        child = next(r for r in rows if r["id"] == child_id)
 
-        parent, child = _pick_parent(row_a, row_b)
-        if parent is None:
-            return jsonify({
-                "error": "matches must pair one Debit (parent) with one Credit (child)"
-            }), 400
         # Parent can be unmatched OR already a top-level parent; never a child.
         if parent["match_parent_id"] is not None:
-            return jsonify({"error": "the Debit row is itself a child of another match"}), 409
-        # Child must be completely unmatched.
-        if child["is_matched"]:
-            return jsonify({"error": "the Credit row is already part of a match"}), 409
+            return jsonify({"error": "the anchor row is itself a child of another match"}), 409
+        # Child must be completely unmatched (not a parent, not already a child).
+        if child["is_matched"] or child["match_parent_id"] is not None:
+            return jsonify({"error": "the dragged row is already part of a match"}), 409
 
         conn.execute(
             "UPDATE transactions SET match_parent_id = ?, is_matched = 1 WHERE id = ?",
@@ -2649,6 +3246,76 @@ def _resolve_period(conn, requested_month, requested_salary_period, requested_ra
     return None
 
 
+_ANCHOR_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _build_month_grid(months_with_data, grid_year, selected_month, selected_range,
+                      selected_salary):
+    """Data for the Diagnostiek period picker: 12 months, 4 quarters, one year.
+
+    Each cell maps onto the existing (month, range) model rather than a new one:
+    a month is `range=1m`, a quarter is `range=3m` anchored on its last month,
+    the year is `range=12m` anchored on December. So the picker is purely a
+    friendlier way to set the two params the backend already understands.
+
+    Cells with no transactions behind them are marked dead, which is what keeps
+    the relaxed anchor validation safe — you cannot click your way to an empty
+    period, only hand-craft a URL to one.
+    """
+    years = sorted({m[:4] for m in months_with_data})
+    has_month = {i: f"{grid_year}-{i:02d}" in months_with_data for i in range(1, 13)}
+
+    grid_months = [
+        {
+            "num": i,
+            "value": f"{grid_year}-{i:02d}",
+            "label": _MONTH_LABELS_NL[i],
+            "has_data": has_month[i],
+            "selected": (not selected_salary and selected_range == "1m"
+                         and selected_month == f"{grid_year}-{i:02d}"),
+        }
+        for i in range(1, 13)
+    ]
+
+    grid_quarters = []
+    for q in range(1, 5):
+        member_months = (q * 3 - 2, q * 3 - 1, q * 3)
+        anchor = f"{grid_year}-{q * 3:02d}"
+        # Shift-clicking a quarter selects its half-year: Q1/Q2 -> Jan-Jun,
+        # Q3/Q4 -> Jul-Dec. That is just range=6m anchored on the half's last
+        # month, so it needs no new period model — and it puts the 6m range
+        # back within reach, which the months/quarters/year grid otherwise drops.
+        half_anchor = f"{grid_year}-06" if q <= 2 else f"{grid_year}-12"
+        half_months = (1, 2, 3, 4, 5, 6) if q <= 2 else (7, 8, 9, 10, 11, 12)
+        grid_quarters.append({
+            "num": q,
+            "anchor": anchor,
+            "has_data": any(has_month[m] for m in member_months),
+            "half_anchor": half_anchor,
+            "half_has_data": any(has_month[m] for m in half_months),
+            "half_label": ("eerste helft" if q <= 2 else "tweede helft"),
+            # A half-year selection lights up both of its quarters, so the grid
+            # shows the span rather than a single anchor cell.
+            "selected": (not selected_salary and (
+                (selected_range == "3m" and selected_month == anchor)
+                or (selected_range == "6m" and selected_month == half_anchor)
+            )),
+        })
+
+    year_has_data = grid_year in years
+    return {
+        "year": grid_year,
+        "months": grid_months,
+        "quarters": grid_quarters,
+        "year_has_data": year_has_data,
+        "year_selected": (not selected_salary and selected_range == "12m"
+                          and selected_month == f"{grid_year}-12"),
+        "year_anchor": f"{grid_year}-12",
+        "prev_year": str(int(grid_year) - 1) if str(int(grid_year) - 1) in years else "",
+        "next_year": str(int(grid_year) + 1) if str(int(grid_year) + 1) in years else "",
+    }
+
+
 def _period_where_sql(period):
     """Return a (sql_fragment, params) pair filtering t.date to within the period."""
     where = ["t.date >= ?"]
@@ -2906,8 +3573,8 @@ def _rule_would_match_any(conn, rule):
         where.append(f"t.{field} REGEXP ?")
         params.append(rf"\b{re.escape(pattern)}\b")
     else:
-        where.append(f"t.{field} LIKE ?")
-        params.append(f"%{pattern}%")
+        where.append(f"t.{field} LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(pattern)}%")
     if rule["amount_min"] is not None:
         where.append("t.amount >= ?")
         params.append(rule["amount_min"])
@@ -2922,8 +3589,8 @@ def _rule_would_match_any(conn, rule):
         # ignores word_boundary. Slight over-match (it'll mark a few rules as
         # "still match" when boundary would have rejected them), but that's
         # safer than crashing the diagnostics page.
-        where_simple = [f"t.{field} LIKE ?"]
-        params_simple = [f"%{pattern}%"]
+        where_simple = [f"t.{field} LIKE ? ESCAPE '\\'"]
+        params_simple = [f"%{_escape_like(pattern)}%"]
         if rule["amount_min"] is not None:
             where_simple.append("t.amount >= ?")
             params_simple.append(rule["amount_min"])
@@ -3121,7 +3788,7 @@ def _build_subscription_buckets(conn):
            FROM transactions t
            JOIN categories c ON c.id = t.category_id
            JOIN topics tp ON tp.id = c.topic_id
-           WHERE tp.name = 'Subscriptions'
+           WHERE tp.name IN ('Subscriptions', 'Abonnementen')
              AND t.direction = 'Debit'"""
     ).fetchall()
 
@@ -3257,11 +3924,10 @@ def _build_fixed_vs_variable(conn, period):
         ).fetchall()
     ]
 
-    # 6-month series for stacked bar
-    if period["mode"] == "month":
-        months = _months_back(period["month"], 6)
-    else:
-        months = _months_back(date.today().strftime("%Y-%m"), 6)
+    # 6-month series for stacked bar, ending at the period's anchor month so
+    # the chart stays inside the selected window (salary mode anchors at the
+    # period's start month).
+    months = _months_back(period.get("month") or period["start"][:7], 6)
     placeholders = ",".join("?" * len(months))
     series_rows = conn.execute(
         f"""SELECT substr(t.date, 1, 7) AS m,
@@ -3315,7 +3981,8 @@ def _build_income_breakdown(conn, period):
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
-              AND t.direction = 'Credit'""",
+              AND t.direction = 'Credit'
+              AND COALESCE(t.is_matched, 0) = 0""",
         params,
     ).fetchall()
     salary = refunds = other = 0.0
@@ -3361,10 +4028,7 @@ def _build_channel_mix(conn, period):
     """Stacked-area data: monthly debit spend grouped by code, last 6 months
     ending at the period's reference month. Surface 'creeping autopay' if
     direct-debit share grew month-over-month in the latest 3 of those months."""
-    if period["mode"] == "month":
-        anchor = period["month"]
-    else:
-        anchor = date.today().strftime("%Y-%m")
+    anchor = period.get("month") or period["start"][:7]
     months = _months_back(anchor, 6)
     placeholders = ",".join("?" * len(months))
     rows = conn.execute(
@@ -3573,7 +4237,11 @@ def _build_topic_concentration(pie, expenses):
     real_topics = [p for p in pie if p["name"] != "Ongecategoriseerd" and p["amount"] > 0]
     if not real_topics or expenses <= 0:
         return None
-    shares = [p["amount"] / expenses for p in real_topics]
+    # HHI shares must sum to 1 over the topics being counted, so they're taken
+    # against the categorized total — dividing by all expenses while dropping
+    # the uncategorized slice understates concentration.
+    real_total = sum(p["amount"] for p in real_topics)
+    shares = [p["amount"] / real_total for p in real_topics]
     top = real_topics[0]
     top_share = top["amount"] / expenses
     hhi = sum(s * s for s in shares) * 10000  # standard 0-10000 scale
@@ -3652,6 +4320,7 @@ def _build_diagnostics(conn, period, balance_account=None):
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
+              AND COALESCE(t.is_matched, 0) = 0
             ORDER BY t.date""",
         params,
     ).fetchall()
@@ -3851,10 +4520,13 @@ def _build_diagnostics(conn, period, balance_account=None):
         if is_current:
             ref_end = today
     else:
-        ref_end = _safe_parse_date(period["end_exclusive"]) if period["end_exclusive"] else today
-        if ref_end and ref_end > today:
+        # end_exclusive is the first day *outside* the period (e.g. the next
+        # salary date) — step back one day so rolling windows don't bleed in
+        # the next period's transactions.
+        end_excl = _safe_parse_date(period["end_exclusive"]) if period["end_exclusive"] else None
+        ref_end = date.fromordinal(end_excl.toordinal() - 1) if end_excl else today
+        if ref_end > today:
             ref_end = today
-        ref_end = ref_end or today
 
     balance_trajectory = _build_balance_trajectory(conn, period, account=balance_account)
     top_merchants = _build_top_merchants(conn, period, limit=10)
@@ -4586,6 +5258,8 @@ def diagnostics():
                 selected_month="", selected_month_label="",
                 selected_salary_period="", selected_period_label="",
                 selected_range="1m",
+                month_grid=None,
+                salary_target="",
                 cached_digest=None,
                 cached_forecast=None,
                 cached_advice=None,
@@ -4602,11 +5276,42 @@ def diagnostics():
             selected_salary = requested_salary
             selected_range = "1m"
         else:
-            month = requested_month if requested_month in valid_months else months[0]["value"]
+            # Anchors are accepted on shape rather than membership: a quarter or
+            # year selection legitimately anchors on a month that holds no
+            # transactions itself (Q4 anchors on December). The grid greys out
+            # cells with no data behind them, so this can't be reached by
+            # clicking — only by editing the URL, which lands on an empty
+            # dashboard rather than a wrong one.
+            if _ANCHOR_MONTH_RE.match(requested_month) and requested_month[:4] in {
+                m["value"][:4] for m in months
+            }:
+                month = requested_month
+            else:
+                month = months[0]["value"]
             period = _resolve_period(conn, month, "", requested_range)
             selected_month = month
             selected_salary = ""
             selected_range = requested_range
+
+        # Which year the picker displays. Defaults to the year of whatever is
+        # selected, so the grid always opens showing the current selection, but
+        # the arrows can move it independently without changing the period.
+        anchor_year = (selected_month or (salary_periods[0]["start"] if salary_periods else ""))[:4]
+        years_with_data = {m["value"][:4] for m in months}
+        requested_year = (request.args.get("year") or "").strip()
+        grid_year = requested_year if requested_year in years_with_data else anchor_year
+        month_grid = _build_month_grid(
+            valid_months, grid_year, selected_month, selected_range, selected_salary
+        )
+
+        # The salary toggle needs a concrete period to switch to: prefer one
+        # starting inside the month you're looking at, else the most recent.
+        salary_target = ""
+        if salary_periods:
+            same_month = next(
+                (p["start"] for p in salary_periods if p["start"][:7] == selected_month), None
+            )
+            salary_target = same_month or salary_periods[0]["start"]
 
         data = _build_diagnostics(conn, period, balance_account=requested_account)
         user = _current_user()
@@ -4630,6 +5335,8 @@ def diagnostics():
         selected_salary_period=selected_salary,
         selected_period_label=period["label"] if period else "",
         selected_range=selected_range,
+        month_grid=month_grid,
+        salary_target=salary_target,
         cached_digest=cached_digest,
         cached_forecast=cached_forecast,
         cached_advice=cached_advice,
@@ -4650,7 +5357,7 @@ def _build_savings_data(conn):
            FROM transactions t
            JOIN categories c ON c.id = t.category_id
            JOIN topics tp ON tp.id = c.topic_id
-           WHERE tp.name = 'Savings'
+           WHERE tp.name IN ('Savings', 'Sparen')
            ORDER BY t.date DESC, t.id DESC"""
     ).fetchall()
 
@@ -4709,6 +5416,14 @@ def eur_filter(v):
     if v is None:
         return ""
     return f"€ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+@app.route("/hulp")
+@login_required
+def help_page():
+    # In-app handleiding. Linked from the main nav so a family member who
+    # hasn't seen the app before can find the basics without leaving the window.
+    return render_template("help.html")
 
 
 @app.route("/health")

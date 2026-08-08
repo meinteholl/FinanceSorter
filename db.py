@@ -45,7 +45,10 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   created_at TEXT,
   active_goal TEXT NOT NULL DEFAULT 'general',
-  auto_generate_ai INTEGER NOT NULL DEFAULT 1
+  auto_generate_ai INTEGER NOT NULL DEFAULT 1,
+  llm_enabled INTEGER NOT NULL DEFAULT 0,
+  llm_model TEXT,
+  llm_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434'
 );
 
 CREATE TABLE IF NOT EXISTS topics (
@@ -139,6 +142,24 @@ CREATE TABLE IF NOT EXISTS ai_summaries (
   UNIQUE(period_key, mode)
 );
 
+-- Cached local-model category guesses, keyed by the same merchant/counterparty
+-- key the history suggester groups on (_merchant_key in app.py). Keying on the
+-- merchant rather than the transaction makes this both a cache — re-running the
+-- sweep costs nothing — and forward-looking: a future row from the same shop is
+-- covered without another model call. Rows are deleted when the user rejects
+-- the suggestion, so a rejected guess doesn't keep resurfacing.
+CREATE TABLE IF NOT EXISTS llm_suggestions (
+  id INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL,              -- 'merchant' | 'counterparty' | 'tx'
+  key TEXT NOT NULL,
+  category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
+  confidence TEXT,
+  reason TEXT,
+  model TEXT,
+  created_at TEXT,
+  UNIQUE(scope, key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
 CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_id);
 CREATE INDEX IF NOT EXISTS idx_categories_topic ON categories(topic_id);
@@ -212,6 +233,23 @@ def init_db():
         if not _column_exists(conn, "users", "auto_generate_ai"):
             conn.execute(
                 "ALTER TABLE users ADD COLUMN auto_generate_ai INTEGER NOT NULL DEFAULT 1"
+            )
+
+        # Migration: users gains local-model (Ollama) settings. These live in the
+        # DB rather than localStorage because the backend is what talks to
+        # Ollama — unlike the Gemini key, which stays client-side precisely
+        # because it's a secret. Ollama needs none. Off by default: the feature
+        # is inert until the user points it at a running Ollama.
+        if not _column_exists(conn, "users", "llm_enabled"):
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN llm_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if not _column_exists(conn, "users", "llm_model"):
+            conn.execute("ALTER TABLE users ADD COLUMN llm_model TEXT")
+        if not _column_exists(conn, "users", "llm_url"):
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN llm_url TEXT NOT NULL "
+                "DEFAULT 'http://127.0.0.1:11434'"
             )
 
         # Bootstrap seed topics + categories on first run.

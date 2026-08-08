@@ -525,6 +525,16 @@ select option[disabled] { color: var(--muted); }
   font-weight: 500;
   box-shadow: inset 2px 0 0 var(--text);
 }
+/* Multi-select filter: mark chosen rows with a trailing check so several
+   selections read clearly at a glance. */
+.cd-popup-multi .cd-option.is-selected::after {
+  content: "✓";
+  margin-left: auto;
+  padding-left: 10px;
+  font-size: 12px;
+  color: var(--text);
+  flex-shrink: 0;
+}
 .cd-option.is-disabled {
   color: var(--muted);
   cursor: default;
@@ -944,8 +954,23 @@ select option[disabled] { color: var(--muted); }
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  margin-bottom: 16px;
   flex-wrap: wrap;
+
+  /* Sticks directly beneath the site topbar (itself sticky at top: 0) so the
+     period you're looking at, and the controls that change it, stay visible
+     while scrolling a very long dashboard. z-index sits below the topbar's 20
+     so it slides underneath rather than over it. */
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 15;
+  background: var(--bg);
+  border-bottom: 1px solid var(--rule);
+
+  /* The container pads 56px each side; bleed back out by that much so the
+     background spans the full width and scrolled rows can't peek past the
+     edges of the bar. */
+  margin: 0 -56px 16px;
+  padding: 14px 56px 12px;
 }
 .dash-title {
   font-family: var(--serif);
@@ -959,29 +984,113 @@ select option[disabled] { color: var(--muted); }
   font-weight: 400;
   font-style: italic;
 }
-.dash-filters { display: flex; gap: 12px; flex-wrap: wrap; margin: 0; }
-.dash-filter { display: flex; flex-direction: column; gap: 2px; }
-.dash-filter label {
-  font-size: 9px;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+/* Period picker — months / quarters / year, plus the salary-period toggle.
+   Replaced three dropdowns: every period is now one click and the whole range
+   of available data is visible at a glance. A 12-column grid keeps each quarter
+   sitting exactly under the three months it covers. */
+.period-picker {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
 }
-.dash-filter select {
+.pp-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(26px, 1fr));
+  border: 1px solid var(--panel-border);
+  background: var(--panel-bg);
+  font-family: var(--sans);
+}
+/* Rows are layout-only wrappers; the cells themselves are the grid items. */
+.pp-row { display: contents; }
+
+.pp-cell {
+  font-size: 12px;
+  line-height: 1;
+  text-align: center;
+  padding: 7px 2px;
+  color: var(--text);
+  text-decoration: none;
+  border-right: 1px solid var(--rule-soft);
+  border-bottom: 1px solid var(--rule-soft);
+  transition: background .12s, color .12s;
+}
+.pp-cell:last-child { border-right: none; }
+.pp-row-months .pp-cell:nth-child(3n) { border-right-color: var(--panel-border); }
+.pp-quarter { grid-column: span 3; font-variant-numeric: tabular-nums; }
+.pp-quarter:last-child { border-right: none; }
+
+a.pp-cell:hover { background: var(--panel-hover); color: var(--text-strong); }
+
+/* Selected period. Mirrors the reference design's outlined+tinted cell, but in
+   the app's own olive rather than importing a foreign teal. */
+.pp-on,
+a.pp-cell.pp-on:hover {
+  background: color-mix(in srgb, var(--pos) 16%, transparent);
+  box-shadow: inset 0 0 0 2px var(--pos);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* Nothing filed in this period — visibly present but unreachable, so the grid
+   doubles as a map of which months you actually have data for. */
+.pp-dead {
+  color: var(--rule);
+  opacity: .55;
+  cursor: default;
+  pointer-events: none;
+}
+
+.pp-row-year {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 6px 4px;
+}
+.pp-year {
+  font-family: var(--serif);
+  font-size: 15px;
+  color: var(--text);
+  text-decoration: none;
+  padding: 2px 10px;
+  font-variant-numeric: tabular-nums;
+}
+a.pp-year:hover { background: var(--panel-hover); color: var(--text-strong); }
+.pp-arrow {
+  font-size: 11px;
+  line-height: 1;
+  color: var(--pos);
+  text-decoration: none;
+  padding: 3px 5px;
+}
+a.pp-arrow:hover { color: var(--text-strong); background: var(--panel-hover); }
+
+/* Salary-period toggle — a bordered label rather than a dropdown, greyed when
+   off, filled when on. */
+.pp-salary {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
   font-family: var(--sans);
   font-size: 12px;
-  background: var(--panel-bg);
+  padding: 0 14px;
+  color: var(--muted);
+  text-decoration: none;
   border: 1px solid var(--panel-border);
-  padding: 4px 8px;
-  color: var(--text);
-  border-radius: 0;
-  outline: none;
-  cursor: pointer;
-  min-width: 130px;
+  background: var(--panel-bg);
+  white-space: nowrap;
+  transition: background .12s, color .12s, box-shadow .12s;
 }
-.dash-filter select:focus { border-color: var(--text); }
-.dash-filter select:disabled { opacity: 0.5; cursor: not-allowed; }
+a.pp-salary:hover { background: var(--panel-hover); color: var(--text-strong); }
+.pp-salary.pp-on {
+  background: color-mix(in srgb, var(--pos) 16%, transparent);
+  box-shadow: inset 0 0 0 2px var(--pos);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+.pp-salary.pp-dead { opacity: .45; pointer-events: none; }
 
 /* KPI strip — 4 equal tiles */
 .dash-kpis {
@@ -1807,6 +1916,62 @@ select option[disabled] { color: var(--muted); }
   height: 7px;
   border-radius: var(--radius-round);
   flex-shrink: 0;
+}
+
+/* Tier-3 suggestion: a local-model guess rather than the user's own history.
+   The dotted rule under it reads as provisional — these always need confirming,
+   where a history-backed suggestion is grounded in what the user actually did. */
+.sug-hint-llm > span:last-child,
+.sug-hint-llm {
+  font-style: italic;
+}
+.sug-hint-llm {
+  border-bottom: 1px dotted var(--rule);
+  padding-bottom: 5px;
+}
+
+/* Page-head actions — sit on the title's baseline, right-aligned, so they cost
+   no vertical space of their own and don't push the tiles apart. */
+.page-head-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* Quiet text action — deliberately not a button-shaped control, so the head
+   stays a reading surface rather than a toolbar. */
+.head-action {
+  display: inline-block;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--rule);
+  border-radius: 0;
+  font-family: var(--serif);
+  font-size: 15px;
+  font-style: italic;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .15s, border-color .15s;
+}
+.head-action:hover:not(:disabled) {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+.head-action:disabled {
+  opacity: .5;
+  cursor: default;
+}
+/* Inline with the button rather than beneath it, so an empty status takes up
+   no space at all. */
+.head-action-status {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 /* checkbox styling — match warm palette */

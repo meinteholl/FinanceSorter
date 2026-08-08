@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Hulp · Finance Sorter{% endblock %}
+
+{% block content %}
+<div class="profile-page">
+  <div class="page-head">
+    <h1 class="page-title">Hulp</h1>
+  </div>
+
+  <section class="profile-section">
+    <h2 class="profile-section-title">Aan de slag</h2>
+    <p class="profile-section-hint muted">
+      Sleep een CSV-export van je ING- of ASN-rekening op een willekeurige plek
+      in het venster. Duplicaten worden automatisch overgeslagen. Loop daarna
+      door de transactielijst en geef elke regel een categorie — de eerste
+      paar honderd doe je zelf, daarna begint de suggestie-engine voor je
+      mee te denken.
+    </p>
+  </section>
+
+  <section class="profile-section">
+    <h2 class="profile-section-title">De pagina's</h2>
+    <p class="profile-section-hint muted">
+      <strong>Transacties</strong> — de werkbank. Hier categoriseer je,
+      filter je op datum of categorie, en koppel je betalingen aan
+      terugbetalingen via sleep-en-laat-los.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>Diagnostiek</strong> — dashboard met inkomsten/uitgaven,
+      anomalieën, terugkerende abonnementen, salariskadans, vaste vs.
+      variabele kosten, en toponderwerpen per maand.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>Sparen</strong> — maandelijkse spaarquote, vaste lasten,
+      abonnementsdrukte. Tegoeden worden hier vanuit het perspectief van
+      de spaarrekening bekeken: een overboeking jouw kant op is een
+      "Credit", niet andersom.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>Categorieën</strong> — beheer onderwerpen (Topics) en de
+      categorieën daarbinnen. Het onderwerp "Salaris" is verplicht; het
+      onderwerp "Sparen" telt niet mee in inkomsten/uitgaven-totalen.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>Regels</strong> — patronen die automatisch een categorie
+      toekennen. Gebruik <em>Bevat</em> voor losse matches ("disney" matcht
+      "Disney+ Subscription") of <em>Alleen heel woord</em> voor strenge
+      matches op woordgrenzen. Een optioneel bedragbereik beperkt de regel
+      tot transacties binnen die min/max.
+    </p>
+  </section>
+
+  <section class="profile-section">
+    <h2 class="profile-section-title">Slimme snelkoppelingen</h2>
+    <p class="profile-section-hint muted">
+      <strong>Rechtermuisklik op een transactie</strong> — kies "Naam naar
+      Regel", "Tegenpartij naar Regel" of "Notificatie naar Regel" om
+      direct naar de Regels-pagina te springen met het veld voor je
+      ingevuld. Je hoeft alleen nog een categorie te kiezen.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>"Vast"-vinkje tijdens categoriseren</strong> — wanneer je
+      een transactie van een categorie voorziet, maakt het vinkje "Vast"
+      direct een regel aan zodat alle vergelijkbare transacties voortaan
+      automatisch worden gecategoriseerd.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>Sleep-en-laat-los koppelen</strong> — sleep een uitgaande
+      betaling op een binnenkomende terugbetaling (of andersom) om ze te
+      koppelen. Gekoppelde paren worden uit inkomsten/uitgaven-totalen
+      gehaald omdat het in feite een interne verschuiving is.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>Suggesties</strong> — na ongeveer 5–10 transacties met
+      hetzelfde patroon stelt de engine een categorie voor (<em>SUGGEST</em>).
+      Na zeker tien voorbeelden met &gt;90% overheersing wordt het automatisch
+      toegepast (<em>AUTO</em>). Klik je een suggestie weg, dan onthoudt de
+      engine dat ook — twee correcties op rij schakelen de suggestie uit.
+    </p>
+  </section>
+
+  <section class="profile-section">
+    <h2 class="profile-section-title">Gegevens en privacy</h2>
+    <p class="profile-section-hint muted">
+      Alles staat lokaal op deze computer in
+      <code>%APPDATA%\FinanceSorter\finance.db</code>. Er gaat geen data
+      naar een server of cloud. Een herinstallatie van de app laat je
+      gegevens met rust.
+    </p>
+    <p class="profile-section-hint muted">
+      <strong>AI-samenvatting</strong> (optioneel) — de Diagnostiek-pagina
+      kan een korte Nederlandstalige samenvatting genereren via Google
+      Generative AI. Daarvoor heb je een Gemini API-sleutel nodig die je
+      op je <a href="{{ url_for('profile') }}">profiel</a> plakt; die
+      sleutel blijft uitsluitend in deze browser. Pas wanneer je op
+      "Genereren" klikt wordt de payload met de API gedeeld.
+    </p>
+  </section>
+
+  <section class="profile-section">
+    <h2 class="profile-section-title">Updates</h2>
+    <p class="profile-section-hint muted">
+      De app kijkt bij het opstarten of er een nieuwere versie beschikbaar
+      is. Zo ja, dan verschijnt een dialoog "Versie X.Y.Z is beschikbaar.
+      Nu installeren?" — klik op Installeren en de app herstart vanzelf
+      met de nieuwe versie. Je gegevens blijven behouden.
+    </p>
+  </section>
+</div>
+{% endblock %}

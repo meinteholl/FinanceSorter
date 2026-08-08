@@ -13,7 +13,8 @@
       "Bash(curl -s -o /dev/null -w 'upload:       %{http_code}\\\\n' http://127.0.0.1:5004/upload)",
       "Bash(curl -s -o /dev/null -w 'api/summary:  %{http_code}\\\\n' http://127.0.0.1:5004/api/summary)",
       "mcp__Claude_Preview__preview_start",
-      "Bash(.venv/Scripts/python.exe -c ' *)"
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\.tauri\" | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize)"
     ]
   }
 }

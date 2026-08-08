@@ -6,33 +6,85 @@
 
   <div class="dash-head">
     <h1 class="dash-title">Diagnostiek{% if selected_period_label %} <span class="dash-title-period">· {{ selected_period_label }}</span>{% endif %}</h1>
-    <form method="get" class="dash-filters">
-      <div class="dash-filter">
-        <label>{% if selected_range and selected_range != '1m' %}Eindigend in maand{% else %}Maand{% endif %}</label>
-        <select name="month" onchange="this.form.querySelector('[name=salary_period]').value=''; this.form.submit()">
-          {% for m in months %}
-            <option value="{{ m.value }}" {% if m.value == selected_month and not selected_salary_period %}selected{% endif %}>{{ m.label }}</option>
+    {% if month_grid %}
+    {# Period picker: months / quarters / year. Every cell is a plain link that
+       sets month+range, so the whole thing works without JavaScript and each
+       period stays a shareable, bookmarkable URL. Cells with no transactions
+       behind them render dead rather than clickable. #}
+    <div class="period-picker">
+      <div class="pp-grid">
+        <div class="pp-row pp-row-months">
+          {% for m in month_grid.months %}
+            {% if m.has_data %}
+              <a class="pp-cell{% if m.selected %} pp-on{% endif %}"
+                 href="{{ url_for('diagnostics', month=m.value, range='1m', year=month_grid.year) }}"
+                 title="{{ m.label }} {{ month_grid.year }}">{{ m.label }}</a>
+            {% else %}
+              <span class="pp-cell pp-dead" title="Geen transacties in {{ m.label }} {{ month_grid.year }}">{{ m.label }}</span>
+            {% endif %}
           {% endfor %}
-        </select>
-      </div>
-      <div class="dash-filter">
-        <label>Bereik</label>
-        <select name="range" onchange="this.form.querySelector('[name=salary_period]').value=''; this.form.submit()">
-          {% for r in range_options %}
-            <option value="{{ r.value }}" {% if r.value == selected_range and not selected_salary_period %}selected{% endif %}>{{ r.label }}</option>
+        </div>
+
+        <div class="pp-row pp-row-quarters">
+          {% for qq in month_grid.quarters %}
+            {% if qq.has_data %}
+              <a class="pp-cell pp-quarter{% if qq.selected %} pp-on{% endif %}"
+                 href="{{ url_for('diagnostics', month=qq.anchor, range='3m', year=month_grid.year) }}"
+                 {% if qq.half_has_data %}data-half="{{ url_for('diagnostics', month=qq.half_anchor, range='6m', year=month_grid.year) }}"{% endif %}
+                 title="Kwartaal {{ qq.num }} van {{ month_grid.year }} · 3 maanden{% if qq.half_has_data %} · shift-klik voor de {{ qq.half_label }} van {{ month_grid.year }}{% endif %}">{{ qq.num }}</a>
+            {% else %}
+              {# Still marked selected when it falls inside the chosen half-year,
+                 so the highlight spans the whole range even where a quarter
+                 happens to hold no transactions. #}
+              <span class="pp-cell pp-quarter pp-dead{% if qq.selected %} pp-on{% endif %}"
+                    title="Geen transacties in kwartaal {{ qq.num }}">{{ qq.num }}</span>
+            {% endif %}
           {% endfor %}
-        </select>
+        </div>
+
+        <div class="pp-row pp-row-year">
+          {% if month_grid.prev_year %}
+            <a class="pp-arrow" rel="prev"
+               href="{{ url_for('diagnostics', month=selected_month, range=selected_range, salary_period=selected_salary_period, year=month_grid.prev_year) }}"
+               title="Naar {{ month_grid.prev_year }}" aria-label="Vorig jaar">&#9664;</a>
+          {% else %}
+            <span class="pp-arrow pp-dead" aria-hidden="true">&#9664;</span>
+          {% endif %}
+
+          {% if month_grid.year_has_data %}
+            <a class="pp-year{% if month_grid.year_selected %} pp-on{% endif %}"
+               href="{{ url_for('diagnostics', month=month_grid.year_anchor, range='12m', year=month_grid.year) }}"
+               title="Heel {{ month_grid.year }} · 12 maanden">{{ month_grid.year }}</a>
+          {% else %}
+            <span class="pp-year pp-dead">{{ month_grid.year }}</span>
+          {% endif %}
+
+          {% if month_grid.next_year %}
+            <a class="pp-arrow" rel="next"
+               href="{{ url_for('diagnostics', month=selected_month, range=selected_range, salary_period=selected_salary_period, year=month_grid.next_year) }}"
+               title="Naar {{ month_grid.next_year }}" aria-label="Volgend jaar">&#9654;</a>
+          {% else %}
+            <span class="pp-arrow pp-dead" aria-hidden="true">&#9654;</span>
+          {% endif %}
+        </div>
       </div>
-      <div class="dash-filter">
-        <label>Salarisperiode</label>
-        <select name="salary_period" onchange="this.form.submit()" {% if not salary_periods %}disabled title="Categoriseer een transactie als Salaris om salarisperiodes te activeren"{% endif %}>
-          <option value="">— Gebruik maand/bereik —</option>
-          {% for p in salary_periods %}
-            <option value="{{ p.start }}" {% if p.start == selected_salary_period %}selected{% endif %}>{{ p.label }}</option>
-          {% endfor %}
-        </select>
-      </div>
-    </form>
+
+      {% if salary_periods %}
+        {% if selected_salary_period %}
+          <a class="pp-salary pp-on"
+             href="{{ url_for('diagnostics', month=selected_month or months[0].value, range='1m', year=month_grid.year) }}"
+             title="Terug naar kalendermaanden">Salarisperiode</a>
+        {% else %}
+          <a class="pp-salary"
+             href="{{ url_for('diagnostics', salary_period=salary_target, year=month_grid.year) }}"
+             title="Rekenen per salarisperiode in plaats van kalendermaand">Salarisperiode</a>
+        {% endif %}
+      {% else %}
+        <span class="pp-salary pp-dead"
+              title="Categoriseer een transactie als Salaris om salarisperiodes te activeren">Salarisperiode</span>
+      {% endif %}
+    </div>
+    {% endif %}
   </div>
 
   {% if not data %}
@@ -621,6 +673,20 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+  // Shift-click a quarter to select its half-year instead (Q1/Q2 -> Jan-Jun,
+  // Q3/Q4 -> Jul-Dec). Plain clicks keep following the href, so the picker
+  // still works entirely without JavaScript — this only adds a shortcut.
+  (function () {
+    document.querySelectorAll('.pp-quarter[data-half]').forEach(function (cell) {
+      cell.addEventListener('click', function (ev) {
+        if (!ev.shiftKey) return;
+        ev.preventDefault();
+        window.location.href = cell.dataset.half;
+      });
+    });
+  })();
+</script>
 {% if data %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>

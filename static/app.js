@@ -11,6 +11,7 @@
       const colIndex = Array.prototype.indexOf.call(th.parentNode.children, th);
       th.addEventListener("click", () => {
         const isNumber = th.dataset.sortType === "number";
+        const useAbs = th.dataset.sortAbs === "true";
         const current = th.getAttribute("aria-sort");
         let dir;
         if (current === "ascending") dir = "descending";
@@ -32,7 +33,8 @@
           const raw = cell.dataset.sort != null ? cell.dataset.sort : cell.textContent.trim();
           if (isNumber) {
             const n = parseFloat(raw);
-            return Number.isNaN(n) ? 0 : n;
+            if (Number.isNaN(n)) return 0;
+            return useAbs ? Math.abs(n) : n;
           }
           return raw;
         };
@@ -98,10 +100,14 @@
   let openPopup = null;
   function closeOpenPopup() {
     if (!openPopup) return;
+    const onClose = openPopup.onClose;
     openPopup.el.remove();
     if (openPopup.cd) openPopup.cd.classList.remove("is-open");
     openPopup.anchor?.setAttribute?.("aria-expanded", "false");
     openPopup = null;
+    // Fired after teardown so a multi-select filter can submit the accumulated
+    // selection once, on close, rather than on every toggle.
+    if (onClose) { try { onClose(); } catch {} }
   }
   function isOpenFor(anchor) { return !!(openPopup && openPopup.anchor === anchor); }
 
@@ -166,20 +172,32 @@
     return item;
   }
 
-  // open({ anchor, currentValue, prependOptions, onPick })
+  // open({ anchor, currentValue, prependOptions, onPick, multi, ... })
   //   anchor:         element to position against (also the toggle-close key)
-  //   currentValue:   string id of currently selected category, or ""
-  //   prependOptions: optional [{label, color, isPlaceholder, onPick}] shown
-  //                   above topics in "topics" mode (pseudo-options like "All"
-  //                   or "Uncategorized only")
-  //   onPick(catId):  called when a real category is picked
-  function open({ anchor, currentValue, prependOptions, onPick }) {
+  //   currentValue:   string id of currently selected category, or "" (single mode)
+  //   prependOptions: optional pseudo-options shown above topics in "topics" mode.
+  //                   Single mode: [{label, color, isPlaceholder, onPick}].
+  //                   Multi mode:  [{label, color, isPlaceholder, value?, isClear?}]
+  //                   — `value` toggles that token, `isClear` deselects all.
+  //   onPick(catId):  called when a category is picked (single mode; closes)
+  //   multi:          when true, picks toggle and the popup stays open
+  //   isSelected(v):  (multi) returns whether token/id v is currently selected
+  //   onToggle(v):    (multi) toggle token/id v
+  //   onClear():      (multi) clear all selections
+  //   onClose():      called after the popup tears down (both modes)
+  function open({ anchor, currentValue, prependOptions, onPick,
+                  multi = false, isSelected, onToggle, onClear, onClose }) {
     const ts = loadTopics();
     closeOpenPopup();
 
     const el = document.createElement("div");
-    el.className = "cd-popup cd-popup-hier";
-    el.setAttribute("role", "listbox");
+    el.className = "cd-popup cd-popup-hier" + (multi ? " cd-popup-multi" : "");
+    el.setAttribute("role", multi ? "listbox" : "listbox");
+    if (multi) el.setAttribute("aria-multiselectable", "true");
+
+    const isSel = (v) => multi
+      ? !!(isSelected && isSelected(String(v)))
+      : String(v) === String(currentValue);
 
     const search = document.createElement("input");
     search.type = "search";
@@ -229,7 +247,7 @@
       activeIdx: -1,
       flatResults: [],
     };
-    openPopup = { anchor, el, cd, state };
+    openPopup = { anchor, el, cd, state, onClose };
 
     renderList();   // also calls positionPopup() at the end
     setTimeout(() => search.focus(), 0);
@@ -283,6 +301,11 @@
     }
 
     function pickCat(catId) {
+      if (multi) {
+        if (onToggle) onToggle(String(catId));
+        renderList();   // stay open; refresh checkmarks
+        return;
+      }
       try { onPick(catId); } finally { closeOpenPopup(); }
     }
 
@@ -294,7 +317,16 @@
             label: opt.label,
             color: opt.color,
             isPlaceholder: !!opt.isPlaceholder,
-            onClick: () => { try { opt.onPick(); } finally { closeOpenPopup(); } },
+            isSelected: multi && opt.value != null && isSel(opt.value),
+            onClick: () => {
+              if (multi) {
+                if (opt.isClear) { if (onClear) onClear(); closeOpenPopup(); }
+                else if (opt.value != null) { if (onToggle) onToggle(String(opt.value)); renderList(); }
+                else { closeOpenPopup(); }
+              } else {
+                try { opt.onPick(); } finally { closeOpenPopup(); }
+              }
+            },
           }));
         }
         for (const t of ts) {
@@ -334,7 +366,7 @@
               label: c.name,
               color: c.color,
               onClick: () => pickCat(String(c.id)),
-              isSelected: String(c.id) === String(currentValue),
+              isSelected: isSel(String(c.id)),
             }));
           }
         }
@@ -351,7 +383,7 @@
               suffix: res.topic.name,
               color: res.cat.color,
               onClick: () => pickCat(String(res.cat.id)),
-              isSelected: String(res.cat.id) === String(currentValue),
+              isSelected: isSel(String(res.cat.id)),
             }));
           }
         }
@@ -679,7 +711,12 @@
         }
         clearPendingState(row);
         flashRow(row, "ok");
-        notify("Suggestie afgewezen. Wordt na nog één afwijzing niet meer voorgesteld.");
+        // The history tier needs two rejections before it gives up (its evidence
+        // is statistical, one disagreement may be noise). A local-model guess is
+        // dropped on the first — say which happened rather than one vague line.
+        notify(sigSource === "llm"
+          ? "Suggestie afgewezen. Het model stelt deze categorie hier niet meer voor."
+          : "Suggestie afgewezen. Wordt na nog één afwijzing niet meer voorgesteld.");
       } catch (err) {
         flashRow(row, "err");
         notify("Kon niet afwijzen: " + err.message);
@@ -725,7 +762,9 @@
 
   function enhance(sel) {
     const isFilter = sel.classList.contains("cat-filter-select");
+    const isMulti = sel.multiple;
     const placeholderLabel = isFilter ? "Alle" : "Categorie…";
+    const catIndex = window.__hierPicker.getCatIndex();
 
     // Build the .cd wrapper around the native select. Same DOM shape as the
     // generic cd enhancer so existing .cd / .cd-trigger / .cd-label styles apply.
@@ -755,7 +794,41 @@
     sel.setAttribute("tabindex", "-1");
     sel.setAttribute("aria-hidden", "true");
 
+    // ---- selection helpers (multi mode reads/writes the native <select multiple>) ----
+    function selectedValues() {
+      return Array.from(sel.selectedOptions).map(o => o.value).filter(v => v !== "");
+    }
+    function labelForValue(v) {
+      if (v === "uncategorized") return "Ongecategoriseerd";
+      const entry = catIndex.get(String(v));
+      return entry ? entry.cat.name : v;
+    }
+    function isValSelected(v) {
+      for (const o of sel.options) if (o.value === String(v)) return o.selected;
+      return false;
+    }
+    function toggleVal(v) {
+      for (const o of sel.options) if (o.value === String(v)) o.selected = !o.selected;
+      syncLabel();
+    }
+    function clearAll() {
+      for (const o of sel.options) o.selected = false;
+      syncLabel();
+    }
+
     function syncLabel() {
+      if (isMulti) {
+        const vals = selectedValues();
+        if (!vals.length) {
+          label.textContent = placeholderLabel;
+          label.classList.add("is-placeholder");
+          return;
+        }
+        label.classList.remove("is-placeholder");
+        const first = labelForValue(vals[0]);
+        label.textContent = vals.length === 1 ? first : `${first} +${vals.length - 1}`;
+        return;
+      }
       const opt = sel.options[sel.selectedIndex];
       const txt = opt ? (opt.textContent || "").trim() : "";
       const isEmpty = !opt || opt.value === "";
@@ -776,6 +849,28 @@
         window.__hierPicker.close();
         return;
       }
+
+      if (isMulti) {
+        // Snapshot so we only reload the page if the selection actually changed.
+        const before = selectedValues().slice().sort().join(",");
+        window.__hierPicker.open({
+          anchor: trigger,
+          multi: true,
+          isSelected: (v) => isValSelected(v),
+          onToggle: (v) => toggleVal(v),
+          onClear: () => clearAll(),
+          prependOptions: [
+            { label: "Alle", isPlaceholder: true, isClear: true },
+            { label: "Alleen ongecategoriseerd", color: "#94a3b8", value: "uncategorized" },
+          ],
+          onClose: () => {
+            const after = selectedValues().slice().sort().join(",");
+            if (after !== before) sel.form?.submit();
+          },
+        });
+        return;
+      }
+
       const cur = sel.value;
       // Only numeric category ids are real picker values; "" and "uncategorized"
       // surface as prepend options above the topic list (filter only).
@@ -886,17 +981,13 @@
   }
 
   function canBeDropTarget(sourceTr, targetTr) {
-    // Strict rule: parent = Debit, child = Credit. Opposite-direction only.
+    // Anchor model: any non-child row can be the drop target (the parent). The
+    // dragged row becomes its child regardless of direction — the group nets
+    // out by signed sum, so N debits under one credit (or vice versa) is valid.
+    // A row already a parent can still receive more children.
     if (!targetTr || targetTr === sourceTr) return false;
     if (!targetTr.classList.contains("tx-row")) return false;
     if (targetTr.classList.contains("tx-row-child")) return false;  // covers ghosts
-    const srcDir = sourceTr.getAttribute("data-direction");
-    const tgtDir = targetTr.getAttribute("data-direction");
-    if (!srcDir || !tgtDir || srcDir === tgtDir) return false;
-    // Already-parent rows (always Debit) can receive new Credit siblings —
-    // partial-reimbursement model where N credits offset one debit.
-    const targetIsParent = targetTr.classList.contains("tx-row-parent");
-    if (targetIsParent && srcDir !== "Credit") return false;
     return true;
   }
 
@@ -973,10 +1064,11 @@
       clearGlow();
       return;
     }
-    // Commit the match — backend picks parent/child by direction + date.
+    // Commit the match — the drop target is the anchor (parent); the dragged
+    // row becomes its child. Direction doesn't matter; the group nets out.
     const targetId = target.getAttribute("data-tx");
     try {
-      const body = new URLSearchParams({ a_id: txId, b_id: targetId });
+      const body = new URLSearchParams({ child_id: txId, parent_id: targetId });
       const res = await fetch("/transactions/match", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1668,4 +1760,159 @@
   });
   window.addEventListener("scroll", hide, true);
   window.addEventListener("resize", hide);
+})();
+
+// ----- Transactions: local-model sweep ("Model raadplegen") -----
+// Asks the backend to run the local model over every uncategorized row that the
+// rule engine and the history suggester could not place. The backend batches by
+// merchant key, so the client just loops until it reports done and reloads once
+// at the end to render the new suggestions.
+(function () {
+  const btn = document.getElementById("llmSweep");
+  const status = document.getElementById("llmSweepStatus");
+  if (!btn || !status) return;
+
+  let running = false;
+
+  // Download mode: no model installed yet, so the button fetches one instead of
+  // sweeping. The pull runs server-side on a background thread; we poll it.
+  async function downloadModel() {
+    const model = btn.dataset.model;
+    const gb = (Number(btn.dataset.size || 0) / 1073741824).toFixed(1);
+    if (!window.confirm(
+      `"${model}" downloaden via Ollama?\n\nDit is eenmalig ongeveer ${gb} GB. ` +
+      `Daarna werkt het categoriseren volledig offline.`)) return;
+
+    btn.disabled = true;
+    status.textContent = "Download starten…";
+
+    try {
+      const res = await fetch("/api/llm/pull", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Starten mislukt (${res.status})`);
+
+      // Poll until the worker reports done. A stalled link surfaces as a
+      // phase that stops advancing rather than a silent hang.
+      for (;;) {
+        await new Promise(r => setTimeout(r, 1500));
+        const s = await fetch("/api/llm/pull").then(r => r.json());
+        if (s.error) throw new Error(s.error);
+        status.textContent = s.percent
+          ? `Downloaden… ${s.percent}%`
+          : (s.phase || "Bezig…");
+        if (s.done) break;
+      }
+
+      status.textContent = "Model klaar · vernieuwen…";
+      setTimeout(() => window.location.reload(), 700);
+    } catch (err) {
+      status.textContent = "Mislukt: " + err.message;
+      btn.disabled = false;
+    }
+  }
+
+  btn.addEventListener("click", async () => {
+    if (running) return;
+    if (btn.dataset.mode === "download") return downloadModel();
+    running = true;
+    btn.disabled = true;
+
+    let stored = 0;
+    let abstained = 0;
+    let processed = 0;
+
+    try {
+      // Loop rather than one long request: each POST handles a handful of
+      // merchants, which keeps the single-threaded dev server responsive and
+      // gives the counter something to move on.
+      for (let guard = 0; guard < 200; guard++) {
+        const res = await fetch("/api/categorize/llm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          // A partial result is still worth keeping — report what landed.
+          stored += data.stored || 0;
+          abstained += data.abstained || 0;
+          throw new Error(data.error || `Aanvraag mislukt (${res.status})`);
+        }
+
+        stored += data.stored || 0;
+        abstained += data.abstained || 0;
+        processed += data.processed || 0;
+
+        const remaining = data.remaining || 0;
+        status.textContent = remaining
+          ? `Bezig… ${stored} voorgesteld, nog ${remaining} te gaan`
+          : `${stored} voorgesteld`;
+
+        if (data.done) break;
+      }
+
+      if (!processed) {
+        status.textContent = "Niets nieuws te beoordelen.";
+        btn.disabled = false;
+        running = false;
+        return;
+      }
+
+      // Abstentions are the model declining to guess on rows it can't place —
+      // say so plainly, they're a correct outcome rather than a failure.
+      status.textContent = stored
+        ? `${stored} voorgesteld${abstained ? `, ${abstained} overgeslagen` : ""} · vernieuwen…`
+        : `Geen suggesties — ${abstained} overgeslagen.`;
+
+      if (stored) {
+        setTimeout(() => window.location.reload(), 700);
+      } else {
+        btn.disabled = false;
+        running = false;
+      }
+    } catch (err) {
+      status.textContent = "Mislukt: " + err.message;
+      btn.disabled = false;
+      running = false;
+    }
+  });
+})();
+
+// ----- Categorieën: let a normal wheel scroll the horizontal topic strip -----
+// .topic-row is a full-bleed horizontal flex strip. A plain wheel scrolls the
+// page, so reaching topics off-screen otherwise required shift+wheel. Translate
+// vertical wheel input into horizontal movement, while leaving the page free to
+// scroll once the strip reaches an end.
+(function () {
+  const row = document.querySelector(".topic-row");
+  if (!row) return;
+
+  row.addEventListener("wheel", (ev) => {
+    // Ctrl+wheel is browser zoom — never touch it.
+    if (ev.ctrlKey) return;
+    // A real horizontal gesture (trackpad swipe) already does the right thing.
+    if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) return;
+    // Nothing to scroll sideways: leave the page alone.
+    if (row.scrollWidth <= row.clientWidth) return;
+    // Don't steal the wheel from a popup that scrolls on its own.
+    if (ev.target.closest(".cd-popup, .cd-list")) return;
+
+    // deltaMode 1 = lines, 2 = pages; normalise to something pixel-ish.
+    const unit = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? row.clientWidth : 1;
+    const delta = ev.deltaY * unit;
+
+    // At either end, hand the gesture back so the page keeps scrolling
+    // normally instead of feeling stuck.
+    const atStart = row.scrollLeft <= 0;
+    const atEnd = Math.ceil(row.scrollLeft + row.clientWidth) >= row.scrollWidth;
+    if ((delta < 0 && atStart) || (delta > 0 && atEnd)) return;
+
+    ev.preventDefault();
+    row.scrollLeft += delta;
+  }, { passive: false });
 })();

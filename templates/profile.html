@@ -60,6 +60,51 @@
   </div>
 
   <section class="profile-section">
+    <h2 class="profile-section-title">Lokaal model voor categorieën</h2>
+    <p class="profile-section-hint muted">
+      Stelt categorieën voor bij transacties waar nog geen regel of geschiedenis
+      voor bestaat. Draait volledig op je eigen machine via
+      <a href="https://ollama.com" target="_blank" rel="noopener">Ollama</a> — anders
+      dan de Gemini-samenvatting krijgt dit model de naam en tegenpartij wél te
+      zien, want zonder die gegevens valt er niets te categoriseren. Er verlaat
+      niets je computer. Suggesties worden nooit automatisch toegepast; je
+      bevestigt ze zelf op de Transacties-pagina.
+    </p>
+
+    <div class="profile-apikey-row">
+      <input type="text"
+             id="llmUrl"
+             class="profile-apikey-input"
+             value="{{ llm.url }}"
+             placeholder="http://127.0.0.1:11434"
+             autocomplete="off"
+             spellcheck="false"
+             aria-label="Ollama-adres">
+      <button type="button" id="llmProbe" class="btn">Verbinding testen</button>
+    </div>
+
+    <div class="profile-apikey-row">
+      <select id="llmModel" class="profile-apikey-input" aria-label="Model">
+        {% if llm.model %}
+          <option value="{{ llm.model }}" selected>{{ llm.model }}</option>
+        {% else %}
+          <option value="">— test eerst de verbinding —</option>
+        {% endif %}
+      </select>
+      <button type="button" id="llmDownload" class="btn" hidden>Model downloaden</button>
+    </div>
+
+    <div class="profile-toggle-row">
+      <label class="profile-toggle">
+        <input type="checkbox" id="llmEnabled" {% if llm.enabled %}checked{% endif %}>
+        <span>Toon de knop "Model raadplegen" op de Transacties-pagina</span>
+      </label>
+    </div>
+    <p id="llmStatus" class="profile-apikey-status muted small"></p>
+    <p id="llmVram" class="profile-section-hint muted small"></p>
+  </section>
+
+  <section class="profile-section">
     <h2 class="profile-section-title">Doelen</h2>
     <p class="profile-section-hint muted">
       Kies de richting waarin de Advies-kaart op Diagnostiek je wilt sturen.
@@ -172,6 +217,182 @@
         checkbox.checked = !enabled;
       }
     });
+  })();
+
+  // Local model (Ollama) settings — probe fills the model picker, and any
+  // change to url/model/enabled is persisted server-side (the backend is what
+  // talks to Ollama, so unlike the Gemini key this can't live in localStorage).
+  (function () {
+    const urlInput = document.getElementById('llmUrl');
+    const probeBtn = document.getElementById('llmProbe');
+    const modelSel = document.getElementById('llmModel');
+    const enabled  = document.getElementById('llmEnabled');
+    const status   = document.getElementById('llmStatus');
+    const vramEl   = document.getElementById('llmVram');
+    const downloadBtn = document.getElementById('llmDownload');
+    if (!urlInput || !probeBtn || !modelSel || !enabled || !status || !vramEl || !downloadBtn) return;
+
+    const savedModel = {{ (llm.model or '') | tojson }};
+
+    // Weights share VRAM with the KV cache and with whatever the desktop
+    // compositor is already holding, so a model that merely fits on paper still
+    // spills into system RAM and crawls. 0.75 leaves room for both.
+    const VRAM_HEADROOM = 0.75;
+    let vramMb = null;
+
+    const gb = (bytes) => (bytes / 1073741824).toFixed(1) + ' GB';
+
+    function tooBig(sizeBytes) {
+      if (!vramMb || !sizeBytes) return false;
+      return sizeBytes / 1048576 > vramMb * VRAM_HEADROOM;
+    }
+
+    function describeFit() {
+      if (!vramMb) {
+        vramEl.textContent = 'Geen NVIDIA-kaart gedetecteerd — kies zelf een model dat in je videogeheugen past.';
+        return;
+      }
+      const gbTotal = Math.round(vramMb / 1024);
+      const advice = gbTotal >= 10
+        ? 'qwen3.5:4b (~3,2 GB) is de standaard en meestal genoeg; met deze kaart kun je 9b (~6,1 GB) ernaast zetten en de twee vergelijken'
+        : gbTotal >= 5
+          ? 'qwen3.5:4b (~3,2 GB) past hier goed — groter loont zelden voor deze taak'
+          : 'kies hier een klein model: qwen3.5:2b (~2,5 GB) of kleiner';
+      const sel = modelSel.selectedOptions[0];
+      const warn = sel && tooBig(Number(sel.dataset.size || 0))
+        ? ` Let op: ${sel.value} is groter dan je videogeheugen aankan — het draait dan deels op de CPU en wordt traag.`
+        : '';
+      vramEl.textContent = `${gbTotal} GB VRAM gedetecteerd — ${advice}.${warn}`;
+      vramEl.className = 'profile-section-hint muted small' + (warn ? ' ai-summary-error' : '');
+    }
+
+    function setStatus(text, cls) {
+      status.textContent = text;
+      status.className = 'profile-apikey-status muted small' + (cls ? ' ' + cls : '');
+    }
+
+    setStatus(enabled.checked
+      ? 'Aan — de knop "Model raadplegen" staat op de Transacties-pagina.'
+      : 'Uit — test de verbinding, kies een model en zet het aan.');
+
+    async function probe() {
+      probeBtn.disabled = true;
+      setStatus('Verbinding testen…');
+      try {
+        const r = await fetch('{{ url_for("api_profile_llm_probe") }}?url=' + encodeURIComponent(urlInput.value.trim()));
+        const data = await r.json();
+        vramMb = data.vram_mb || null;
+        if (!data.ok) {
+          setStatus(data.error || 'Ollama niet bereikbaar.', 'ai-summary-error');
+          describeFit();
+          return false;
+        }
+        if (!data.models.length) {
+          // Offer the download here rather than sending the user to a terminal.
+          const rec = data.recommended;
+          if (rec) {
+            downloadBtn.hidden = false;
+            downloadBtn.dataset.model = rec.model;
+            downloadBtn.dataset.size = rec.size;
+            downloadBtn.textContent =
+              `${rec.model} downloaden (~${(rec.size / 1073741824).toFixed(1)} GB)`;
+            setStatus('Ollama draait, maar er is nog geen model geïnstalleerd.');
+          } else {
+            setStatus('Ollama draait, maar er is nog geen model geïnstalleerd.', 'ai-summary-error');
+          }
+          describeFit();
+          return false;
+        }
+        downloadBtn.hidden = true;
+        // Rebuild the picker, keeping the saved model selected if it's still
+        // installed. Each option carries its on-disk size so the fit warning
+        // can be recomputed without another round trip.
+        modelSel.innerHTML = '';
+        data.models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m.name;
+          opt.dataset.size = m.size || 0;
+          opt.textContent = m.name + (m.size ? ` — ${gb(m.size)}` : '')
+            + (tooBig(m.size) ? '  (past niet)' : '');
+          if (m.name === (modelSel.dataset.current || savedModel)) opt.selected = true;
+          modelSel.appendChild(opt);
+        });
+        setStatus(data.models.length + ' model(len) gevonden.');
+        describeFit();
+        return true;
+      } catch (e) {
+        setStatus('Verbinding mislukt: ' + e.message, 'ai-summary-error');
+        return false;
+      } finally {
+        probeBtn.disabled = false;
+      }
+    }
+
+    async function save() {
+      const body = {
+        enabled: enabled.checked,
+        model: modelSel.value || '',
+        url: urlInput.value.trim(),
+      };
+      try {
+        const r = await fetch('{{ url_for("api_profile_llm") }}', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        if (!r.ok || !data.ok) {
+          setStatus(data.error || ('Opslaan mislukt (HTTP ' + r.status + ').'), 'ai-summary-error');
+          if (data.error) enabled.checked = false;
+          return;
+        }
+        modelSel.dataset.current = data.model;
+        setStatus(data.enabled
+          ? 'Opgeslagen — de knop "Model raadplegen" staat op de Transacties-pagina.'
+          : 'Opgeslagen. Uit — er verschijnt geen knop.');
+      } catch (e) {
+        setStatus('Opslaan mislukt: ' + e.message, 'ai-summary-error');
+      }
+    }
+
+    downloadBtn.addEventListener('click', async () => {
+      const model = downloadBtn.dataset.model;
+      const gb = (Number(downloadBtn.dataset.size || 0) / 1073741824).toFixed(1);
+      if (!window.confirm(`"${model}" downloaden via Ollama?\n\nDit is eenmalig ongeveer ${gb} GB.`)) return;
+      downloadBtn.disabled = true;
+      setStatus('Download starten…');
+      try {
+        const r = await fetch('{{ url_for("api_llm_pull_start") }}', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || ('Starten mislukt (' + r.status + ')'));
+        for (;;) {
+          await new Promise(res => setTimeout(res, 1500));
+          const s = await fetch('{{ url_for("api_llm_pull_status") }}').then(x => x.json());
+          if (s.error) throw new Error(s.error);
+          setStatus(s.percent ? `Downloaden… ${s.percent}%` : (s.phase || 'Bezig…'));
+          if (s.done) break;
+        }
+        setStatus('Model gedownload en ingeschakeld.');
+        downloadBtn.hidden = true;
+        await probe();
+      } catch (e) {
+        setStatus('Download mislukt: ' + e.message, 'ai-summary-error');
+        downloadBtn.disabled = false;
+      }
+    });
+
+    probeBtn.addEventListener('click', probe);
+    modelSel.addEventListener('change', () => { describeFit(); save(); });
+    enabled.addEventListener('change', save);
+    urlInput.addEventListener('change', save);
+
+    // Detect the card on load so the sizing advice is there before the user
+    // has touched anything — the probe call also returns it, cheaply.
+    probe();
   })();
 
   // Goal selection — clicking a card sets it active and posts to the server.

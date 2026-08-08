@@ -2,15 +2,24 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-if "%~1"=="" (
-  echo Usage: DeployUpdate.bat ^<new-version^> [release-notes]
-  echo Example: DeployUpdate.bat 0.1.1 "Fixed drag-drop on transactions page"
+set "NEW_VERSION=%~1"
+set "NOTES=%~2"
+
+REM Prompt interactively when launched by double-click (no args).
+if "%NEW_VERSION%"=="" (
+  echo Deploy a new version of Finance Sorter to GitHub.
+  echo.
+  set /p "NEW_VERSION=Version number (e.g. 0.1.1): "
+)
+if "%NEW_VERSION%"=="" (
+  echo [error] No version provided. Aborting.
   echo.
   pause
   exit /b 1
 )
-set "NEW_VERSION=%~1"
-set "NOTES=%~2"
+if "%NOTES%"=="" (
+  set /p "NOTES=Release notes (optional, press Enter to skip): "
+)
 if "%NOTES%"=="" set "NOTES=Update to v%NEW_VERSION%."
 
 set "KEY_PATH=%USERPROFILE%\.tauri\finance-sorter.key"
@@ -51,10 +60,13 @@ copy /Y ".\dist\finance-sorter-backend.exe" ".\src-tauri\binaries\finance-sorter
 if errorlevel 1 ( echo [error] could not stage sidecar. & goto :failed )
 
 REM ---- 3. Tauri build with signing -------------------------------------------
+REM Route through build-signed.ps1, which sets a genuinely EMPTY password env
+REM var via the Win32 API. (Neither cmd nor PowerShell can set an empty env
+REM var directly -- both delete it, which Tauri interprets as a prompt
+REM request — that's how you'd hit "Decrypting updater signing key, expect a
+REM prompt for password" mid-build.)
 echo [3/6] Building signed Tauri installer (this takes a few minutes)...
-set "TAURI_SIGNING_PRIVATE_KEY=%KEY_PATH%"
-set "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
-cargo tauri build
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-signed.ps1" -KeyPath "%KEY_PATH%"
 if errorlevel 1 ( echo [error] cargo tauri build failed. & goto :failed )
 
 REM ---- 4. Build latest.json update manifest ----------------------------------

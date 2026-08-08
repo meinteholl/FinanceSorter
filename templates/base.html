@@ -21,6 +21,7 @@
       <a href="{{ url_for('savings') }}" class="nav-link {% if request.endpoint == 'savings' %}active{% endif %}">Sparen</a>
       <a href="{{ url_for('categories') }}" class="nav-link {% if request.endpoint == 'categories' %}active{% endif %}">Categorieën</a>
       <a href="{{ url_for('rules') }}" class="nav-link {% if request.endpoint == 'rules' %}active{% endif %}">Regels</a>
+      <a href="{{ url_for('help_page') }}" class="nav-link {% if request.endpoint == 'help_page' %}active{% endif %}">Hulp</a>
     </nav>
     {% endif %}
   </header>

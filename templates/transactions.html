@@ -25,11 +25,10 @@
       </div>
       <div class="filter">
         <label>Categorie</label>
-        <select name="category" class="cat-filter-select" data-cd-skip onchange="this.form.submit()">
-          <option value="">Alle</option>
-          <option value="uncategorized" {% if selected_category == 'uncategorized' %}selected{% endif %}>Alleen ongecategoriseerd</option>
+        <select name="category" multiple class="cat-filter-select" data-cd-skip>
+          <option value="uncategorized" {% if selected_uncat %}selected{% endif %}>Alleen ongecategoriseerd</option>
           {% for c in categories %}
-            <option value="{{ c.id }}" {% if selected_category == c.id|string %}selected{% endif %}>{{ c.name }}</option>
+            <option value="{{ c.id }}" {% if c.id|string in selected_cat_ids %}selected{% endif %}>{{ c.name }}</option>
           {% endfor %}
         </select>
       </div>
@@ -44,7 +43,10 @@
       </div>
       <div class="filter grow">
         <label>Zoeken</label>
-        <input type="search" name="q" value="{{ q }}" placeholder="Naam, tegenpartij, opmerking..." data-auto-submit="400">
+        <input type="search" name="q" value="{{ q }}"
+               placeholder="Naam, tegenpartij, bedrag..."
+               title="Zoek op tekst of op bedrag. '12,50' zoekt dat exacte bedrag, '12' alles van 12,00 tot 12,99."
+               data-auto-submit="400">
       </div>
     </form>
 
@@ -63,12 +65,34 @@
   <div class="tx-main">
     <div class="page-head">
       <h1 class="page-title">Transacties</h1>
-      {% if selected_date %}
-        <a href="{{ url_for('transactions') }}" class="filter-chip" title="Dagfilter wissen">
-          Dag · {{ selected_date }}
-          <span class="filter-chip-x" aria-hidden="true">×</span>
-        </a>
-      {% endif %}
+      <div class="page-head-right">
+        {% if selected_date %}
+          <a href="{{ url_for('transactions') }}" class="filter-chip" title="Dagfilter wissen">
+            Dag · {{ selected_date }}
+            <span class="filter-chip-x" aria-hidden="true">×</span>
+          </a>
+        {% endif %}
+        {% if llm_ui.enabled %}
+          <span id="llmSweepStatus" class="head-action-status muted" role="status" aria-live="polite"></span>
+          {% if llm_ui.has_model %}
+            {# Sweeps the whole backlog, not just the filtered view — answers are
+               cached per tegenpartij, so one pass covers future rows too. #}
+            <button type="button" id="llmSweep" class="head-action" data-mode="sweep"
+                    title="Laat het lokale model categorieën voorstellen voor alles wat nog openstaat. Suggesties worden nooit automatisch toegepast.">
+              Model raadplegen
+            </button>
+          {% else %}
+            {# No model yet: the same button downloads one, so a fresh machine
+               never needs a terminal. Size is in the label — this is GBs. #}
+            <button type="button" id="llmSweep" class="head-action" data-mode="download"
+                    data-model="{{ llm_ui.recommended.model }}"
+                    data-size="{{ llm_ui.recommended.size }}"
+                    title="Download het aanbevolen model via Ollama ({{ llm_ui.recommended.model }}). Eenmalig; daarna werkt alles offline.">
+              Model downloaden (~{{ (llm_ui.recommended.size / 1073741824) | round(1) }} GB)
+            </button>
+          {% endif %}
+        {% endif %}
+      </div>
     </div>
 
     <div class="tiles">
@@ -100,7 +124,7 @@
           <th class="sortable" data-sort-key="date" data-sort-default="desc" aria-sort="none">Datum</th>
           <th class="sortable" data-sort-key="name" aria-sort="none">Naam</th>
           <th></th>
-          <th class="num col-amount sortable" data-sort-key="amount" data-sort-type="number" data-sort-default="desc" aria-sort="none">Bedrag</th>
+          <th class="num col-amount sortable" data-sort-key="amount" data-sort-type="number" data-sort-abs="true" data-sort-default="desc" aria-sort="none">Bedrag</th>
           <th class="cell-cat">Categorie</th>
         </tr>
       </thead>
@@ -130,9 +154,13 @@
             {% endif %}
             <span class="date-text">{{ r.date }}</span>
             {% if is_child %}
-              <span class="match-link" title="Terugbetaling gekoppeld aan bijbehorende uitgave">↳ terugbetaling</span>
+              {% if r.direction == 'Credit' %}
+                <span class="match-link" title="Bijschrijving gekoppeld aan deze groep — verrekend met het nettobedrag">↳ terugbetaling</span>
+              {% else %}
+                <span class="match-link" title="Afschrijving gekoppeld aan deze groep — verrekend met het nettobedrag">↳ uitgave</span>
+              {% endif %}
             {% elif is_ghost %}
-              <span class="match-link" title="Oorspronkelijke uitgave vóór terugbetalingen">↳ origineel</span>
+              <span class="match-link" title="Oorspronkelijk bedrag vóór koppelingen">↳ origineel</span>
             {% endif %}
           </td>
           <td data-sort="{{ (r.name or '') | lower }}">
@@ -174,10 +202,20 @@
               </label>
             </div>
             {% if sug %}
-              <div class="sug-hint" title="{{ sug.signals | join(' + ') if sug.signals else 'geschiedenis' }} · {{ sug.tier }} niveau">
-                <span class="sug-dot" style="background: {{ sug.category_color }};"></span>
-                {% if sug.tier == 'AUTO' %}Hoge zekerheid{% else %}Voorgesteld{% endif %} · op basis van {{ sug.sample_count }} vergelijkbare
-              </div>
+              {% if sug.source == 'llm' %}
+                {# Tier 3: no history existed for this counterparty, so the local
+                   model guessed from the merchant name. Always confirm-first. #}
+                <div class="sug-hint sug-hint-llm"
+                     title="Voorgesteld door het lokale model ({{ sug.model }}) · zekerheid: {{ sug.confidence or 'onbekend' }}. Er is nog geen geschiedenis voor deze tegenpartij.">
+                  <span class="sug-dot" style="background: {{ sug.category_color }};"></span>
+                  Lokaal model{% if sug.reason %} · {{ sug.reason }}{% endif %}
+                </div>
+              {% else %}
+                <div class="sug-hint" title="{{ sug.signals | join(' + ') if sug.signals else 'geschiedenis' }} · {{ sug.tier }} niveau">
+                  <span class="sug-dot" style="background: {{ sug.category_color }};"></span>
+                  {% if sug.tier == 'AUTO' %}Hoge zekerheid{% else %}Voorgesteld{% endif %} · op basis van {{ sug.sample_count }} vergelijkbare
+                </div>
+              {% endif %}
             {% endif %}
             {% endif %}
           </td>
