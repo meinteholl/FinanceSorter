@@ -1,0 +1,7 @@
+# cmd.exe seeks by byte offset when running a .bat file and assumes CRLF.
+# With LF-only endings the offsets drift, so `goto` lands mid-line: build.bat
+# silently fell through its error path, and DeployUpdate.bat garbled outright.
+# Force CRLF on checkout so these always run correctly on Windows.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
