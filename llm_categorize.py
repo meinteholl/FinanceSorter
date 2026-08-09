@@ -49,6 +49,24 @@ MAX_TOKENS = 120
 EXAMPLES_PER_CATEGORY = 3
 MAX_EXAMPLES = 120
 
+# Context window requested from Ollama. Without this the daemon uses its own
+# default (commonly 4096), and a prompt that exceeds it is silently TRUNCATED
+# rather than rejected — you get a confident answer built from a fraction of
+# the instructions.
+NUM_CTX = 8192
+
+# Hard ceiling on the assembled system prompt, in characters (~3.5 chars per
+# token), leaving room inside NUM_CTX for the transaction line and the reply.
+#
+# This is the important one. The taxonomy sits at the top of the prompt, so an
+# overflow drops the category list and the output rules while the examples at
+# the end survive — the model then reasons correctly about the merchant and
+# attaches an essentially arbitrary id, because constrained decoding still
+# forces a valid one. Measured on a padded prompt: 4/4 correct at 2.7k tokens,
+# 1/4 at 25k, with unrelated merchants all collapsing onto the same category.
+# Examples are dropped until the prompt fits; the taxonomy is never sacrificed.
+PROMPT_CHAR_BUDGET = 16000
+
 # Representative merchant names shown inline next to each category. The category
 # names alone are undefined — nothing in "Food > Lunch" vs "Food > Snacks" tells
 # the model where this user draws the line. Naming a few real merchants per
@@ -386,11 +404,20 @@ def build_context(conn, examples_per_category=EXAMPLES_PER_CATEGORY,
         if len(examples) >= max_examples:
             break
 
-    system = _SYSTEM_TEMPLATE.format(
-        categories="\n".join(cat_lines),
-        examples="\n".join(examples) if examples
-        else "(nog geen gecategoriseerde transacties beschikbaar)",
-    )
+    def assemble(example_lines):
+        return _SYSTEM_TEMPLATE.format(
+            categories="\n".join(cat_lines),
+            examples="\n".join(example_lines) if example_lines
+            else "(nog geen gecategoriseerde transacties beschikbaar)",
+        )
+
+    # Drop examples until the prompt fits the budget. Examples are the
+    # expendable part; the rules and the category list are not, and letting
+    # Ollama truncate instead would silently discard exactly those.
+    system = assemble(examples)
+    while examples and len(system) > PROMPT_CHAR_BUDGET:
+        examples.pop()
+        system = assemble(examples)
 
     return {
         "system": system,
@@ -504,7 +531,7 @@ def classify(context, tx, model, url=DEFAULT_URL, timeout=CLASSIFY_TIMEOUT):
         "format": context["schema"],
         "stream": False,
         "keep_alive": KEEP_ALIVE,
-        "options": {"temperature": 0, "num_predict": MAX_TOKENS},
+        "options": {"temperature": 0, "num_predict": MAX_TOKENS, "num_ctx": NUM_CTX},
         # Reasoning-capable models (Qwen3 and friends) would otherwise burn
         # seconds per row on a think block we throw away.
         "think": False,

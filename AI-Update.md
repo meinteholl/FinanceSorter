@@ -143,7 +143,7 @@ When the user lands on Diagnostics and the period looks "clean," generate all th
 
 - Uncategorized transactions for the period = 0
 - No cached summary exists for the current period (any of the three modes missing)
-- A Gemini API key is present in localStorage
+- A Gemini API key is stored on the user's profile (`users.gemini_api_key`)
 - The user hasn't already auto-generated for this period in this session (prevents repeat fires on navigation)
 
 ### Behavior

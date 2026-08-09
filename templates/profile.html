@@ -22,15 +22,16 @@
     <section class="profile-section">
       <h2 class="profile-section-title">Gemini API-sleutel</h2>
       <p class="profile-section-hint muted">
-        Wordt gebruikt door de AI-samenvatting op de Diagnostiek-pagina. Alleen
-        in deze browser opgeslagen — wordt nooit naar de server gestuurd behalve
-        bij het genereren van een samenvatting.
+        Wordt gebruikt door de AI-samenvatting op de Diagnostiek-pagina. Wordt
+        opgeslagen in je profiel op deze computer, zodat hij een herstart en een
+        update overleeft. Gaat alleen naar Google bij het genereren van een
+        samenvatting.
       </p>
       <div class="profile-apikey-row">
         <input type="password"
                id="profileApiKey"
                class="ai-summary-key profile-apikey-input"
-               placeholder="Plak hier je Gemini API-sleutel"
+               placeholder="{% if gemini_key_hint %}Plak een nieuwe sleutel om te vervangen{% else %}Plak hier je Gemini API-sleutel{% endif %}"
                autocomplete="off"
                spellcheck="false"
                aria-label="Gemini API-sleutel">
@@ -145,40 +146,53 @@
     const status = document.getElementById('profileApiKeyStatus');
     if (!input || !clearBtn || !status) return;
 
-    const KEY_STORAGE = 'aiSummaryKey';
+    // The key lives in the profile row on the server, not in localStorage: the
+    // desktop shell serves this page from a different 127.0.0.1 port on every
+    // launch, and localStorage is partitioned per origin — so a key saved in
+    // the browser was gone the next time the app opened.
+    const SAVE_URL = '{{ url_for("api_profile_gemini_key") }}';
+    let hint = {{ (gemini_key_hint or '') | tojson }};
 
-    function readSaved() {
-      try { return localStorage.getItem(KEY_STORAGE) || ''; } catch (e) { return ''; }
-    }
     function setStatus(text) { status.textContent = text; }
+    function setSavedStatus() {
+      setStatus(hint
+        ? 'Opgeslagen in je profiel (' + hint + ').'
+        : 'Geen sleutel opgeslagen.');
+    }
+    setSavedStatus();
 
-    const initial = readSaved();
-    input.value = initial;
-    setStatus(initial ? 'Opgeslagen in deze browser.' : 'Geen sleutel opgeslagen.');
+    async function save(payload, pending) {
+      setStatus(pending);
+      try {
+        const r = await fetch(SAVE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await r.json();
+        if (!r.ok) { setStatus(data.error || 'Opslaan mislukt.'); return; }
+        hint = data.hint || '';
+        setSavedStatus();
+      } catch (e) {
+        setStatus('Opslaan mislukt: ' + e.message);
+      }
+    }
 
     let saveTimer = null;
     input.addEventListener('input', () => {
       clearTimeout(saveTimer);
+      const value = input.value.trim();
+      // An empty field means "nothing typed yet", never "delete the key" — the
+      // field starts empty on every visit. Wissen is the way to remove one.
+      if (!value) { setSavedStatus(); return; }
       setStatus('Opslaan…');
-      saveTimer = setTimeout(() => {
-        try {
-          if (input.value) {
-            localStorage.setItem(KEY_STORAGE, input.value);
-            setStatus('Opgeslagen in deze browser.');
-          } else {
-            localStorage.removeItem(KEY_STORAGE);
-            setStatus('Geen sleutel opgeslagen.');
-          }
-        } catch (e) {
-          setStatus('Kon niet opslaan — localStorage niet beschikbaar.');
-        }
-      }, 250);
+      saveTimer = setTimeout(() => save({ api_key: value }, 'Opslaan…'), 400);
     });
 
     clearBtn.addEventListener('click', () => {
+      clearTimeout(saveTimer);
       input.value = '';
-      try { localStorage.removeItem(KEY_STORAGE); } catch (e) { /* ignore */ }
-      setStatus('Geen sleutel opgeslagen.');
+      save({ clear: true }, 'Wissen…');
       input.focus();
     });
   })();

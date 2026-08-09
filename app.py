@@ -1025,6 +1025,31 @@ def _get_user_llm_settings(conn, user_id):
     }
 
 
+def _get_user_gemini_key(conn, user_id):
+    """The user's stored Gemini key, or '' when there isn't one."""
+    if not user_id:
+        return ""
+    try:
+        row = conn.execute(
+            "SELECT gemini_api_key FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    if not row:
+        return ""
+    return (row["gemini_api_key"] or "").strip()
+
+
+def _mask_key(key):
+    """Enough of the key to recognise which one is stored, never enough to use."""
+    key = (key or "").strip()
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "•" * len(key)
+    return f"{key[:4]}…{key[-4:]}"
+
+
 # ---------- routes ----------
 
 @app.route("/")
@@ -1146,12 +1171,16 @@ def profile():
         active_goal_id = _get_user_active_goal_id(conn, user_id)
         auto_generate_ai = _get_user_auto_generate(conn, user_id)
         llm = _get_user_llm_settings(conn, user_id)
+        gemini_key = _get_user_gemini_key(conn, user_id)
+    # The key itself never goes back to the page — only the masked hint, so the
+    # field can say which key is stored without re-exposing it on every visit.
     return render_template(
         "profile.html",
         goals=GOALS,
         active_goal_id=active_goal_id,
         auto_generate_ai=auto_generate_ai,
         llm=llm,
+        gemini_key_hint=_mask_key(gemini_key),
     )
 
 
@@ -1190,6 +1219,33 @@ def api_profile_auto_generate():
         )
         conn.commit()
     return jsonify({"ok": True, "enabled": bool(enabled)})
+
+
+@app.route("/api/profile/gemini_key", methods=["POST"])
+def api_profile_gemini_key():
+    """Store or clear the user's Gemini API key.
+
+    Clearing takes an explicit `{"clear": true}`: an empty text field is a field
+    the user hasn't typed in yet — the page never prefills the real key — so
+    treating "empty" as "delete" would wipe the key on every stray keystroke."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Niet ingelogd."}), 401
+    body = request.get_json(silent=True) or {}
+
+    if body.get("clear"):
+        key = ""
+    else:
+        key = (body.get("api_key") or "").strip()
+        if not key:
+            return jsonify({"error": "Geen sleutel opgegeven."}), 400
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET gemini_api_key = ? WHERE id = ?", (key, user["id"])
+        )
+        conn.commit()
+    return jsonify({"ok": True, "has_key": bool(key), "hint": _mask_key(key)})
 
 
 @app.route("/api/profile/llm", methods=["POST"])
@@ -5110,9 +5166,9 @@ def _get_user_auto_generate(conn, user_id):
 @app.route("/api/diagnostics/ai_summary", methods=["POST"])
 def api_diagnostics_ai_summary():
     """Send a scrubbed, aggregated summary of the period to Gemini and return
-    the prose response. The caller supplies their own Gemini API key in the
-    JSON body — it is used once per request and never persisted server-side.
-    Never sends `account` or `counterparty`; never sends `name` or
+    the prose response. The Gemini key is read from the logged-in user's profile
+    (`users.gemini_api_key`) rather than the request body, so the page never has
+    to hold it. Never sends `account` or `counterparty`; never sends `name` or
     `notifications` either — only topic/category-level aggregates.
 
     Query param `mode` selects one of three prompt templates:
@@ -5120,11 +5176,6 @@ def api_diagnostics_ai_summary():
     goal is read from `users.active_goal` and baked into the cache key so
     each goal caches independently."""
     import json
-
-    body = request.get_json(silent=True) or {}
-    api_key = (body.get("api_key") or "").strip()
-    if not api_key:
-        return jsonify({"error": "api_key ontbreekt in de request body."}), 400
 
     try:
         from google import genai
@@ -5146,6 +5197,13 @@ def api_diagnostics_ai_summary():
     user_id = user["id"] if user else None
 
     with get_connection() as conn:
+        api_key = _get_user_gemini_key(conn, user_id)
+        if not api_key:
+            return jsonify({
+                "error": "Geen Gemini API-sleutel opgeslagen. "
+                         "Voeg er een toe op je Profiel-pagina."
+            }), 400
+
         period = _resolve_period(conn, requested_month, requested_salary, requested_range)
         if not period:
             return jsonify({"error": "Geen periode geselecteerd."}), 400
@@ -5265,6 +5323,7 @@ def diagnostics():
                 cached_advice=None,
                 active_goal=GOALS[empty_goal_id] | {"id": empty_goal_id},
                 auto_generate_ai=empty_auto,
+                has_gemini_key=bool(_get_user_gemini_key(conn, empty_uid)),
             )
 
         valid_months = {m["value"] for m in months}
@@ -5318,6 +5377,7 @@ def diagnostics():
         user_id = user["id"] if user else None
         active_goal_id = _get_user_active_goal_id(conn, user_id)
         auto_generate_ai = _get_user_auto_generate(conn, user_id)
+        has_gemini_key = bool(_get_user_gemini_key(conn, user_id))
         cached_digest = _load_cached_ai_summary(conn, period, mode="digest")
         cached_forecast = _load_cached_ai_summary(conn, period, mode="forecast")
         cached_advice = _load_cached_ai_summary(
@@ -5342,6 +5402,7 @@ def diagnostics():
         cached_advice=cached_advice,
         active_goal=GOALS[active_goal_id] | {"id": active_goal_id},
         auto_generate_ai=auto_generate_ai,
+        has_gemini_key=has_gemini_key,
     )
 
 

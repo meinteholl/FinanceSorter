@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS users (
   auto_generate_ai INTEGER NOT NULL DEFAULT 1,
   llm_enabled INTEGER NOT NULL DEFAULT 0,
   llm_model TEXT,
-  llm_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434'
+  llm_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434',
+  gemini_api_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS topics (
@@ -236,10 +237,8 @@ def init_db():
             )
 
         # Migration: users gains local-model (Ollama) settings. These live in the
-        # DB rather than localStorage because the backend is what talks to
-        # Ollama — unlike the Gemini key, which stays client-side precisely
-        # because it's a secret. Ollama needs none. Off by default: the feature
-        # is inert until the user points it at a running Ollama.
+        # DB because the backend is what talks to Ollama. Off by default: the
+        # feature is inert until the user points it at a running Ollama.
         if not _column_exists(conn, "users", "llm_enabled"):
             conn.execute(
                 "ALTER TABLE users ADD COLUMN llm_enabled INTEGER NOT NULL DEFAULT 0"
@@ -251,6 +250,17 @@ def init_db():
                 "ALTER TABLE users ADD COLUMN llm_url TEXT NOT NULL "
                 "DEFAULT 'http://127.0.0.1:11434'"
             )
+
+        # Migration: users gains `gemini_api_key`. The key used to live in the
+        # browser's localStorage, which looked like the safer home for a secret
+        # but does not survive a restart: the Tauri shell serves the app from
+        # http://127.0.0.1:<ephemeral port>, and the port — and therefore the
+        # origin localStorage is partitioned by — is new on every launch. So the
+        # key silently vanished every time the app was reopened. Stored here it
+        # persists across launches and updates, at the cost of sitting in
+        # plaintext next to the financial data it is used to summarise.
+        if not _column_exists(conn, "users", "gemini_api_key"):
+            conn.execute("ALTER TABLE users ADD COLUMN gemini_api_key TEXT")
 
         # Bootstrap seed topics + categories on first run.
         topic_count = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
