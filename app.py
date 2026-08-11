@@ -13,7 +13,7 @@ from functools import wraps
 
 from flask import (
     Flask, render_template, request, redirect, url_for, jsonify, flash, abort,
-    session, g, Response
+    session, g, Response, stream_with_context
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -5312,21 +5312,6 @@ def _parse_audio_mime(mime):
     return bits, rate, channels
 
 
-def _pcm_to_wav(pcm_bytes, bits_per_sample, sample_rate, channels):
-    """Wrap raw little-endian PCM in a WAV container so a browser <audio>
-    element can play it. TTS output is always bare PCM."""
-    import io
-    import wave
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(channels or 1)
-        wf.setsampwidth(max(1, (bits_per_sample or 16) // 8))
-        wf.setframerate(sample_rate or 24000)
-        wf.writeframes(pcm_bytes)
-    return buf.getvalue()
-
-
 @app.route("/api/diagnostics/ai_speak", methods=["POST"])
 def api_diagnostics_ai_speak():
     """Speak one AI insight card out loud. Returns audio/wav bytes.
@@ -5374,12 +5359,8 @@ def api_diagnostics_ai_speak():
     if not text:
         return jsonify({"error": "Nog niets om voor te lezen — genereer dit inzicht eerst."}), 404
 
-    # TTS is generated as a stream of PCM chunks. Collect them all and emit one
-    # WAV — each chunk is bare samples, so the header goes on the joined bytes,
-    # not on every chunk.
-    chunks = []
-    audio_mime = ""
-    try:
+    def pcm_parts():
+        """Yield the raw PCM payload of every audio part, in order."""
         client = genai.Client(api_key=api_key)
         stream = client.models.generate_content_stream(
             model=GEMINI_TTS_MODEL,
@@ -5405,27 +5386,44 @@ def api_diagnostics_ai_speak():
             for part in (chunk.parts or []):
                 inline = getattr(part, "inline_data", None)
                 if inline and inline.data:
-                    chunks.append(inline.data)
-                    if not audio_mime:
-                        audio_mime = inline.mime_type or ""
+                    yield inline.mime_type or "", inline.data
+
+    # Pull the first chunk before responding. It carries the sample rate the
+    # rest of the stream uses, and the response headers that describe the
+    # format have to go out ahead of the body. It also means an auth or quota
+    # failure still surfaces as a JSON error rather than a truncated stream.
+    parts = pcm_parts()
+    try:
+        first_mime, first_data = next(parts)
+    except StopIteration:
+        return jsonify({"error": "Gemini gaf geen audio terug."}), 502
     except Exception as e:
         return jsonify({"error": f"Gemini-spraakaanroep mislukt: {e.__class__.__name__}: {e}"}), 502
 
-    if not chunks:
-        return jsonify({"error": "Gemini gaf geen audio terug."}), 502
+    bits, rate, channels = _parse_audio_mime(first_mime)
 
-    audio = b"".join(chunks)
-    # Anything that isn't already a container is bare PCM and needs a header.
-    if not audio_mime.strip().lower().startswith("audio/wav"):
-        bits, rate, channels = _parse_audio_mime(audio_mime)
-        audio = _pcm_to_wav(audio, bits, rate, channels)
+    def generate():
+        """Bare PCM, first chunk first. The browser assembles and schedules it
+        with the Web Audio API, so no container is written — a WAV header would
+        have to declare a length nobody knows yet."""
+        yield first_data
+        try:
+            for _mime, data in parts:
+                yield data
+        except Exception:
+            # Mid-stream failure: headers are long gone, so the only honest
+            # option is to end the body. The client plays what arrived.
+            app.logger.exception("TTS stream failed after first chunk")
 
     return Response(
-        audio,
-        mimetype="audio/wav",
+        stream_with_context(generate()),
+        mimetype=f"audio/L{bits}",
         headers={
-            "Content-Length": str(len(audio)),
+            "X-Audio-Sample-Rate": str(rate),
+            "X-Audio-Channels": str(channels),
+            "X-Audio-Bits": str(bits),
             "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
         },
     )
 

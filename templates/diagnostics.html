@@ -960,8 +960,10 @@
     });
 
     // Read-out-loud — one speaker button per card, backed by Gemini TTS.
-    // The audio blob is cached per mode for the life of the page so replaying
-    // a card costs nothing; regenerating that card drops its cached audio.
+    // The endpoint streams raw PCM as the model produces it; each chunk is
+    // scheduled on a Web Audio clock the moment it lands, so speech starts
+    // after the first chunk instead of after the whole take. The PCM is kept
+    // per mode so replaying costs nothing; regenerating a card drops it.
     (function speech() {
       const SPEAKER_SVG = '<svg class="ai-speak-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
         + '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>';
@@ -970,8 +972,10 @@
       const LOADING_SVG = '<svg class="ai-speak-icon ai-spinner" viewBox="0 0 24 24" aria-hidden="true">'
         + '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="14 42" stroke-linecap="round"/></svg>';
 
-      const audioUrls = {};   // mode -> object URL of the fetched WAV
-      let current = null;     // { mode, audio } of whatever is playing
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const pcmCache = {};    // mode -> { pcm: Int16Array, rate, channels }
+      let ctx = null;         // one AudioContext, created on first play
+      let current = null;     // playback session for whatever is talking
 
       function speakBtn(mode) {
         return row.querySelector('.ai-card-speak[data-mode="' + mode + '"]');
@@ -1009,25 +1013,55 @@
 
       function stopCurrent() {
         if (!current) return;
-        const { mode, audio } = current;
+        const session = current;
         current = null;
-        audio.pause();
-        audio.currentTime = 0;
-        setState(mode, 'idle');
+        session.cancelled = true;
+        if (session.reader) { try { session.reader.cancel(); } catch (e) {} }
+        session.sources.forEach(s => { try { s.stop(); } catch (e) {} });
+        session.sources.length = 0;
+        setState(session.mode, 'idle');
       }
 
-      // Dropping the object URL forces a fresh fetch next time — used when a
+      // Dropping the cached PCM forces a fresh fetch next time — used when a
       // card's text changes underneath us.
       function invalidate(mode) {
         if (current && current.mode === mode) stopCurrent();
-        if (audioUrls[mode]) {
-          URL.revokeObjectURL(audioUrls[mode]);
-          delete audioUrls[mode];
-        }
+        delete pcmCache[mode];
       }
 
-      async function audioUrlFor(mode) {
-        if (audioUrls[mode]) return audioUrls[mode];
+      // Int16 little-endian -> AudioBuffer, de-interleaving if multi-channel.
+      function toBuffer(samples, rate, channels) {
+        const frames = Math.floor(samples.length / channels);
+        const buf = ctx.createBuffer(channels, frames, rate);
+        for (let ch = 0; ch < channels; ch++) {
+          const out = buf.getChannelData(ch);
+          for (let i = 0; i < frames; i++) out[i] = samples[i * channels + ch] / 32768;
+        }
+        return buf;
+      }
+
+      // Queue one buffer to play the instant the previous one finishes.
+      function schedule(session, samples) {
+        if (session.cancelled || !samples.length) return;
+        const buf = toBuffer(samples, session.rate, session.channels);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        // A small lead-in on the first chunk absorbs jitter between chunks;
+        // after that each one is butted directly against the previous.
+        session.playAt = Math.max(session.playAt, ctx.currentTime + 0.08);
+        src.start(session.playAt);
+        session.playAt += buf.duration;
+        session.pending++;
+        session.sources.push(src);
+        src.onended = () => {
+          session.pending--;
+          if (session.done && session.pending <= 0 && current === session) stopCurrent();
+        };
+        if (current === session) setState(session.mode, 'playing');
+      }
+
+      async function streamInto(session, mode) {
         const r = await fetch('/api/diagnostics/ai_speak?mode=' + encodeURIComponent(mode) + '&' + periodQueryString(), {
           method: 'POST',
         });
@@ -1039,9 +1073,42 @@
           } catch (e) { /* non-JSON error body — keep the generic message */ }
           throw new Error(msg);
         }
-        const url = URL.createObjectURL(await r.blob());
-        audioUrls[mode] = url;
-        return url;
+        session.rate = parseInt(r.headers.get('X-Audio-Sample-Rate') || '24000', 10);
+        session.channels = parseInt(r.headers.get('X-Audio-Channels') || '1', 10);
+
+        const reader = r.body.getReader();
+        session.reader = reader;
+        const collected = [];
+        let carry = new Uint8Array(0);   // a 16-bit sample can straddle a chunk
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done || session.cancelled) break;
+          let bytes = value;
+          if (carry.length) {
+            const merged = new Uint8Array(carry.length + value.length);
+            merged.set(carry, 0);
+            merged.set(value, carry.length);
+            bytes = merged;
+          }
+          const usable = bytes.length - (bytes.length % 2);
+          carry = bytes.slice(usable);
+          if (!usable) continue;
+          // Copy into a fresh buffer so the Int16Array is 2-byte aligned.
+          const samples = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + usable));
+          collected.push(samples);
+          schedule(session, samples);
+        }
+        session.done = true;
+
+        if (!session.cancelled && collected.length) {
+          let total = 0;
+          collected.forEach(s => { total += s.length; });
+          const all = new Int16Array(total);
+          let at = 0;
+          collected.forEach(s => { all.set(s, at); at += s.length; });
+          pcmCache[mode] = { pcm: all, rate: session.rate, channels: session.channels };
+        }
+        if (!collected.length) throw new Error('Gemini gaf geen audio terug.');
       }
 
       async function toggle(mode) {
@@ -1056,31 +1123,42 @@
           showSpeakError(mode, 'Nog niets om voor te lezen — genereer dit inzicht eerst.');
           return;
         }
-
-        setState(mode, 'loading');
-        let url;
-        try {
-          url = await audioUrlFor(mode);
-        } catch (e) {
-          setState(mode, 'idle');
-          showSpeakError(mode, e.message);
+        if (!AudioCtx) {
+          showSpeakError(mode, 'Deze browser ondersteunt geen Web Audio.');
           return;
         }
 
-        const audio = new Audio(url);
-        audio.addEventListener('ended', stopCurrent);
-        audio.addEventListener('error', () => {
-          invalidate(mode);
-          showSpeakError(mode, 'Audio kon niet worden afgespeeld.');
-        });
-        current = { mode, audio };
-        setState(mode, 'playing');
-        try {
-          await audio.play();
-        } catch (e) {
-          stopCurrent();
-          showSpeakError(mode, 'Afspelen geweigerd door de browser: ' + e.message);
+        // Must happen inside the click handler, or autoplay policy blocks it.
+        if (!ctx) ctx = new AudioCtx();
+        if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
+
+        const session = {
+          mode, cancelled: false, done: false, pending: 0, sources: [],
+          playAt: 0, rate: 24000, channels: 1, reader: null,
+        };
+        current = session;
+
+        // Replay: already have the PCM, so schedule it in one go.
+        const hit = pcmCache[mode];
+        if (hit) {
+          session.rate = hit.rate;
+          session.channels = hit.channels;
+          session.done = true;
+          schedule(session, hit.pcm);
+          return;
         }
+
+        setState(mode, 'loading');
+        try {
+          await streamInto(session, mode);
+        } catch (e) {
+          if (session.cancelled) return;
+          stopCurrent();
+          showSpeakError(mode, e.message);
+          return;
+        }
+        // Nothing left to schedule and nothing still sounding.
+        if (current === session && session.pending <= 0) stopCurrent();
       }
 
       row.querySelectorAll('.ai-card-speak').forEach(btn => {
