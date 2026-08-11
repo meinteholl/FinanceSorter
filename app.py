@@ -4996,6 +4996,12 @@ def _store_ai_summary(conn, period, summary_text, model, mode="digest", goal_id=
             datetime.utcnow().isoformat(timespec="seconds"),
         ),
     )
+    # New words mean the cached speech is obsolete. The text_hash check would
+    # catch it anyway, but dropping the row here reclaims the megabyte now
+    # instead of leaving it parked until the card is next played.
+    conn.execute(
+        "DELETE FROM ai_audio WHERE period_key = ? AND mode = ?", (key, mode)
+    )
     conn.commit()
 
 
@@ -5283,6 +5289,89 @@ AI_SPEECH_PROMPT = (
 )
 
 
+# Generated speech is kept in the database so a card is only ever synthesised
+# once. Raw 24kHz 16-bit mono runs ~1.4 MB per 30 seconds, so the cache is
+# capped and evicted least-recently-used rather than allowed to grow forever.
+AI_AUDIO_BUDGET_BYTES = 40 * 1024 * 1024
+
+
+def _speech_text_hash(text):
+    """Identify the exact words the audio speaks."""
+    import hashlib
+
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:32]
+
+
+def _load_cached_audio(conn, period_key, mode, text_hash):
+    """Return cached PCM for this card, or None.
+
+    A row only counts as a hit when the text, voice and model all still match
+    what we would generate today — otherwise the audio is stale and gets
+    re-synthesised (and overwritten) on this request.
+    """
+    row = conn.execute(
+        """SELECT pcm, sample_rate, channels, bits
+             FROM ai_audio
+            WHERE period_key = ? AND mode = ? AND text_hash = ?
+              AND voice = ? AND model = ?""",
+        (period_key, mode, text_hash, GEMINI_TTS_VOICE, GEMINI_TTS_MODEL),
+    ).fetchone()
+    if not row or not row["pcm"]:
+        return None
+    conn.execute(
+        "UPDATE ai_audio SET last_used_at = ? WHERE period_key = ? AND mode = ?",
+        (datetime.utcnow().isoformat(timespec="seconds"), period_key, mode),
+    )
+    conn.commit()
+    return {
+        "pcm": bytes(row["pcm"]),
+        "rate": row["sample_rate"],
+        "channels": row["channels"],
+        "bits": row["bits"],
+    }
+
+
+def _store_cached_audio(conn, period_key, mode, text_hash, pcm, rate, channels, bits):
+    """Upsert the audio for this card, then evict LRU rows over the budget."""
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO ai_audio
+             (period_key, mode, text_hash, voice, model,
+              sample_rate, channels, bits, pcm, byte_size, created_at, last_used_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(period_key, mode) DO UPDATE SET
+             text_hash    = excluded.text_hash,
+             voice        = excluded.voice,
+             model        = excluded.model,
+             sample_rate  = excluded.sample_rate,
+             channels     = excluded.channels,
+             bits         = excluded.bits,
+             pcm          = excluded.pcm,
+             byte_size    = excluded.byte_size,
+             created_at   = excluded.created_at,
+             last_used_at = excluded.last_used_at""",
+        (period_key, mode, text_hash, GEMINI_TTS_VOICE, GEMINI_TTS_MODEL,
+         rate, channels, bits, pcm, len(pcm), now, now),
+    )
+    # Evict oldest-used rows until the cache fits the budget. The row just
+    # written is the most recently used, so it is never the one dropped.
+    rows = conn.execute(
+        "SELECT id, byte_size FROM ai_audio ORDER BY last_used_at DESC, id DESC"
+    ).fetchall()
+    running = 0
+    doomed = []
+    for i, r in enumerate(rows):
+        running += r["byte_size"] or 0
+        # Always keep the most recently used row, even if it alone is over
+        # budget — otherwise a single long clip would be evicted the instant
+        # it was written and could never be cached at all.
+        if i > 0 and running > AI_AUDIO_BUDGET_BYTES:
+            doomed.append(r["id"])
+    if doomed:
+        conn.executemany("DELETE FROM ai_audio WHERE id = ?", [(i,) for i in doomed])
+    conn.commit()
+
+
 def _parse_audio_mime(mime):
     """Return (bits_per_sample, sample_rate, channels) for a PCM audio mime type.
 
@@ -5355,9 +5444,33 @@ def api_diagnostics_ai_speak():
         goal_id = _get_user_active_goal_id(conn, user_id) if mode == "advice" else None
         cached = _load_cached_ai_summary(conn, period, mode=mode, goal_id=goal_id)
 
-    text = ((cached or {}).get("summary") or "").strip()
-    if not text:
-        return jsonify({"error": "Nog niets om voor te lezen — genereer dit inzicht eerst."}), 404
+        text = ((cached or {}).get("summary") or "").strip()
+        if not text:
+            return jsonify({"error": "Nog niets om voor te lezen — genereer dit inzicht eerst."}), 404
+
+        # Already spoken these exact words? Replay costs nothing.
+        audio_key = _ai_summary_period_key(period, mode, goal_id)
+        text_hash = _speech_text_hash(text)
+        hit = _load_cached_audio(conn, audio_key, mode, text_hash)
+
+    if hit:
+        def replay():
+            pcm = hit["pcm"]
+            for i in range(0, len(pcm), 32768):
+                yield pcm[i:i + 32768]
+
+        return Response(
+            replay(),
+            mimetype=f"audio/L{hit['bits']}",
+            headers={
+                "X-Audio-Sample-Rate": str(hit["rate"]),
+                "X-Audio-Channels": str(hit["channels"]),
+                "X-Audio-Bits": str(hit["bits"]),
+                "X-Audio-Cached": "1",
+                "Content-Length": str(len(hit["pcm"])),
+                "Cache-Control": "no-store",
+            },
+        )
 
     def pcm_parts():
         """Yield the raw PCM payload of every audio part, in order."""
@@ -5405,15 +5518,30 @@ def api_diagnostics_ai_speak():
     def generate():
         """Bare PCM, first chunk first. The browser assembles and schedules it
         with the Web Audio API, so no container is written — a WAV header would
-        have to declare a length nobody knows yet."""
+        have to declare a length nobody knows yet.
+
+        Chunks are kept as they go past so the finished take can be cached. Only
+        a stream that ran to completion is stored — a mid-stream failure or a
+        client that walked away would otherwise persist truncated speech."""
+        collected = [first_data]
         yield first_data
         try:
             for _mime, data in parts:
+                collected.append(data)
                 yield data
         except Exception:
             # Mid-stream failure: headers are long gone, so the only honest
             # option is to end the body. The client plays what arrived.
             app.logger.exception("TTS stream failed after first chunk")
+            return
+
+        try:
+            with get_connection() as store_conn:
+                _store_cached_audio(store_conn, audio_key, mode, text_hash,
+                                    b"".join(collected), rate, channels, bits)
+        except Exception:
+            # A cache write must never break playback that already succeeded.
+            app.logger.exception("Could not cache TTS audio")
 
     return Response(
         stream_with_context(generate()),
@@ -5422,6 +5550,7 @@ def api_diagnostics_ai_speak():
             "X-Audio-Sample-Rate": str(rate),
             "X-Audio-Channels": str(channels),
             "X-Audio-Bits": str(bits),
+            "X-Audio-Cached": "0",
             "Cache-Control": "no-store",
             "X-Accel-Buffering": "no",
         },

@@ -143,6 +143,32 @@ CREATE TABLE IF NOT EXISTS ai_summaries (
   UNIQUE(period_key, mode)
 );
 
+-- Cached text-to-speech audio for the AI insight cards, keyed by the same
+-- (period_key, mode) pair as ai_summaries. Stores raw little-endian PCM exactly
+-- as the model produced it; zlib only reaches ~85% of raw on speech, so the
+-- CPU cost of compressing isn't worth the space.
+--
+-- text_hash/voice/model pin the audio to the text it was generated from: a
+-- regenerated summary, a different voice, or a model upgrade all miss the cache
+-- and re-synthesise, so stale audio can never outlive the words it speaks.
+-- last_used_at drives LRU eviction once the cache exceeds its byte budget.
+CREATE TABLE IF NOT EXISTS ai_audio (
+  id INTEGER PRIMARY KEY,
+  period_key TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'digest',
+  text_hash TEXT NOT NULL,
+  voice TEXT,
+  model TEXT,
+  sample_rate INTEGER NOT NULL DEFAULT 24000,
+  channels INTEGER NOT NULL DEFAULT 1,
+  bits INTEGER NOT NULL DEFAULT 16,
+  pcm BLOB NOT NULL,
+  byte_size INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT,
+  last_used_at TEXT,
+  UNIQUE(period_key, mode)
+);
+
 -- Cached local-model category guesses, keyed by the same merchant/counterparty
 -- key the history suggester groups on (_merchant_key in app.py). Keying on the
 -- merchant rather than the transaction makes this both a cache — re-running the
@@ -161,6 +187,7 @@ CREATE TABLE IF NOT EXISTS llm_suggestions (
   UNIQUE(scope, key)
 );
 
+CREATE INDEX IF NOT EXISTS idx_ai_audio_lru ON ai_audio(last_used_at);
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
 CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_id);
 CREATE INDEX IF NOT EXISTS idx_categories_topic ON categories(topic_id);
