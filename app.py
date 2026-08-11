@@ -5276,8 +5276,8 @@ AI_SPEECH_INSTRUCTION = (
 
 def _pcm_to_wav(pcm_bytes, sample_rate, channels):
     """Wrap raw signed 16-bit little-endian PCM in a WAV container so a browser
-    <audio> element can play it. The TTS model returns bare PCM when the
-    requested container isn't honoured."""
+    <audio> element can play it. The TTS models always return bare PCM —
+    `response_format` accepts no container preference."""
     import io
     import wave
 
@@ -5288,6 +5288,24 @@ def _pcm_to_wav(pcm_bytes, sample_rate, channels):
         wf.setframerate(sample_rate or 24000)
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
+
+
+def _parse_audio_mime(mime):
+    """Split an audio mime type into (base, params).
+
+    Gemini 3.1 TTS returns "audio/l16; rate=24000; channels=1" — lowercase
+    'l' and trailing parameters, where 2.5 returned "audio/L16;rate=24000".
+    Comparing the raw string against a fixed literal misses both, so
+    normalise the base and pull the rate/channels out of the parameters.
+    """
+    parts = (mime or "").split(";")
+    base = parts[0].strip().lower()
+    params = {}
+    for chunk in parts[1:]:
+        if "=" in chunk:
+            k, _, v = chunk.partition("=")
+            params[k.strip().lower()] = v.strip()
+    return base, params
 
 
 def _extract_audio_block(interaction):
@@ -5354,13 +5372,13 @@ def api_diagnostics_ai_speak():
         interaction = client.interactions.create(
             model=GEMINI_TTS_MODEL,
             input=AI_SPEECH_INSTRUCTION + text,
-            response_format={
-                "type": "audio",
-                "mime_type": "audio/wav",
-                "delivery": "inline",
-            },
+            # `type` is the only key response_format takes for audio — sending
+            # mime_type/delivery is a 400 ("Audio mime_type is not supported in
+            # response_format"). Likewise speech_config takes voice/speaker
+            # only; the model detects the input language on its own.
+            response_format={"type": "audio"},
             generation_config={
-                "speech_config": [{"voice": GEMINI_TTS_VOICE, "language": "nl-NL"}],
+                "speech_config": [{"voice": GEMINI_TTS_VOICE}],
             },
         )
     except Exception as e:
@@ -5375,13 +5393,18 @@ def api_diagnostics_ai_speak():
     except Exception:
         return jsonify({"error": "Audio van Gemini kon niet worden gedecodeerd."}), 502
 
-    # audio/wav already carries its own header; audio/l16 is bare PCM and needs one.
-    if (getattr(block, "mime_type", "") or "").lower() != "audio/wav":
-        audio = _pcm_to_wav(
-            audio,
-            getattr(block, "sample_rate", None) or 24000,
-            getattr(block, "channels", None) or 1,
-        )
+    # audio/wav already carries its own header; L16 is bare PCM and needs one.
+    # The rate/channels live either on the block or in the mime parameters.
+    base, params = _parse_audio_mime(getattr(block, "mime_type", ""))
+    if base != "audio/wav":
+        def _num(key, attr, default):
+            try:
+                return int(params[key])
+            except (KeyError, TypeError, ValueError):
+                return getattr(block, attr, None) or default
+
+        audio = _pcm_to_wav(audio, _num("rate", "sample_rate", 24000),
+                            _num("channels", "channels", 1))
 
     return Response(
         audio,
