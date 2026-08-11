@@ -4927,7 +4927,7 @@ GEMINI_MODEL = "gemini-3.6-flash"
 # Text-to-speech for the "read this card out loud" buttons. Separate model —
 # the prose models can't emit audio.
 GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
-GEMINI_TTS_VOICE = "Kore"
+GEMINI_TTS_VOICE = "Aoede"
 
 
 def _ai_summary_period_key(period, mode="digest", goal_id=None):
@@ -5264,59 +5264,67 @@ def api_diagnostics_ai_summary():
     return jsonify(result)
 
 
-# Read out loud — spoken Dutch, so tell the model how to handle the "€1.890"
-# style amounts the prose prompts produce. Prefixed to the cached summary text.
-AI_SPEECH_INSTRUCTION = (
-    "Lees de volgende financiële tekst rustig, duidelijk en in vloeiend "
-    "Nederlands voor. Spreek eurobedragen uit als woorden (\"€1.890\" wordt "
-    "\"achttienhonderdnegentig euro\"). Lees alleen de tekst voor; voeg niets "
-    "toe en laat niets weg.\n\n"
+# Read out loud — the TTS models take direction, not just text, so the prompt
+# is the AI Studio "audio profile / director's note / transcript" shape with
+# the cached summary dropped in as the transcript.
+AI_SPEECH_PROMPT = (
+    "Read the following transcript based on the audio profile and "
+    "director's note.\n\n"
+    "# Audio Profile\n"
+    "Een vriendin/moederfiguur\n\n"
+    "# Director's note\n"
+    "Style: The \"Vocal Smile\": The soft palate is raised to keep the tone "
+    "bright, sunny, and explicitly inviting. Pace: Natural. Accent: Neutral.\n\n"
+    "## Scene:\n"
+    "Je legt iets uit.\n\n"
+    "## Sample Context:\n"
+    "Een vriendelijke en rustige toon\n\n"
+    "## Transcript:\n"
 )
 
 
-def _pcm_to_wav(pcm_bytes, sample_rate, channels):
-    """Wrap raw signed 16-bit little-endian PCM in a WAV container so a browser
-    <audio> element can play it. The TTS models always return bare PCM —
-    `response_format` accepts no container preference."""
+def _parse_audio_mime(mime):
+    """Return (bits_per_sample, sample_rate, channels) for a PCM audio mime type.
+
+    Gemini 3.1 TTS sends "audio/l16; rate=24000; channels=1" where 2.5 sent
+    "audio/L16;rate=24000" — lowercase, with extra parameters. The match on the
+    "audio/L<bits>" segment is therefore case-insensitive; testing it with
+    str.startswith("audio/L") is what broke Home Assistant's integration.
+    """
+    bits, rate, channels = 16, 24000, 1
+    for param in (mime or "").split(";"):
+        param = param.strip().lower()
+        if param.startswith("rate="):
+            try:
+                rate = int(param.split("=", 1)[1])
+            except (ValueError, IndexError):
+                pass
+        elif param.startswith("channels="):
+            try:
+                channels = int(param.split("=", 1)[1])
+            except (ValueError, IndexError):
+                pass
+        elif param.startswith("audio/l"):
+            try:
+                bits = int(param.split("l", 1)[1])
+            except (ValueError, IndexError):
+                pass
+    return bits, rate, channels
+
+
+def _pcm_to_wav(pcm_bytes, bits_per_sample, sample_rate, channels):
+    """Wrap raw little-endian PCM in a WAV container so a browser <audio>
+    element can play it. TTS output is always bare PCM."""
     import io
     import wave
 
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(channels or 1)
-        wf.setsampwidth(2)
+        wf.setsampwidth(max(1, (bits_per_sample or 16) // 8))
         wf.setframerate(sample_rate or 24000)
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
-
-
-def _parse_audio_mime(mime):
-    """Split an audio mime type into (base, params).
-
-    Gemini 3.1 TTS returns "audio/l16; rate=24000; channels=1" — lowercase
-    'l' and trailing parameters, where 2.5 returned "audio/L16;rate=24000".
-    Comparing the raw string against a fixed literal misses both, so
-    normalise the base and pull the rate/channels out of the parameters.
-    """
-    parts = (mime or "").split(";")
-    base = parts[0].strip().lower()
-    params = {}
-    for chunk in parts[1:]:
-        if "=" in chunk:
-            k, _, v = chunk.partition("=")
-            params[k.strip().lower()] = v.strip()
-    return base, params
-
-
-def _extract_audio_block(interaction):
-    """Walk an Interaction's model_output steps and return the first audio
-    content block, or None. The SDK types the step list as a discriminated
-    union, so attribute access is guarded rather than assumed."""
-    for step in (getattr(interaction, "steps", None) or []):
-        for block in (getattr(step, "content", None) or []):
-            if getattr(block, "type", None) == "audio" and getattr(block, "data", None):
-                return block
-    return None
 
 
 @app.route("/api/diagnostics/ai_speak", methods=["POST"])
@@ -5328,10 +5336,9 @@ def api_diagnostics_ai_speak():
     to Google, which keeps the same privacy posture as the summary endpoint.
     A card that hasn't been generated yet has nothing to read, so that's a 404.
     """
-    import base64
-
     try:
         from google import genai
+        from google.genai import types
     except ImportError:
         return jsonify({"error": "google-genai is niet geïnstalleerd. Voer uit: pip install google-genai"}), 503
 
@@ -5367,44 +5374,51 @@ def api_diagnostics_ai_speak():
     if not text:
         return jsonify({"error": "Nog niets om voor te lezen — genereer dit inzicht eerst."}), 404
 
+    # TTS is generated as a stream of PCM chunks. Collect them all and emit one
+    # WAV — each chunk is bare samples, so the header goes on the joined bytes,
+    # not on every chunk.
+    chunks = []
+    audio_mime = ""
     try:
         client = genai.Client(api_key=api_key)
-        interaction = client.interactions.create(
+        stream = client.models.generate_content_stream(
             model=GEMINI_TTS_MODEL,
-            input=AI_SPEECH_INSTRUCTION + text,
-            # `type` is the only key response_format takes for audio — sending
-            # mime_type/delivery is a 400 ("Audio mime_type is not supported in
-            # response_format"). Likewise speech_config takes voice/speaker
-            # only; the model detects the input language on its own.
-            response_format={"type": "audio"},
-            generation_config={
-                "speech_config": [{"voice": GEMINI_TTS_VOICE}],
-            },
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=AI_SPEECH_PROMPT + text)],
+                ),
+            ],
+            config=types.GenerateContentConfig(
+                temperature=1,
+                response_modalities=["audio"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=GEMINI_TTS_VOICE
+                        )
+                    )
+                ),
+            ),
         )
+        for chunk in stream:
+            for part in (chunk.parts or []):
+                inline = getattr(part, "inline_data", None)
+                if inline and inline.data:
+                    chunks.append(inline.data)
+                    if not audio_mime:
+                        audio_mime = inline.mime_type or ""
     except Exception as e:
         return jsonify({"error": f"Gemini-spraakaanroep mislukt: {e.__class__.__name__}: {e}"}), 502
 
-    block = _extract_audio_block(interaction)
-    if block is None:
+    if not chunks:
         return jsonify({"error": "Gemini gaf geen audio terug."}), 502
 
-    try:
-        audio = base64.b64decode(block.data)
-    except Exception:
-        return jsonify({"error": "Audio van Gemini kon niet worden gedecodeerd."}), 502
-
-    # audio/wav already carries its own header; L16 is bare PCM and needs one.
-    # The rate/channels live either on the block or in the mime parameters.
-    base, params = _parse_audio_mime(getattr(block, "mime_type", ""))
-    if base != "audio/wav":
-        def _num(key, attr, default):
-            try:
-                return int(params[key])
-            except (KeyError, TypeError, ValueError):
-                return getattr(block, attr, None) or default
-
-        audio = _pcm_to_wav(audio, _num("rate", "sample_rate", 24000),
-                            _num("channels", "channels", 1))
+    audio = b"".join(chunks)
+    # Anything that isn't already a container is bare PCM and needs a header.
+    if not audio_mime.strip().lower().startswith("audio/wav"):
+        bits, rate, channels = _parse_audio_mime(audio_mime)
+        audio = _pcm_to_wav(audio, bits, rate, channels)
 
     return Response(
         audio,
