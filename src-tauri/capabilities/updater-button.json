@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "updater-button",
+  "description": "Let the app's own UI, served by the Flask sidecar on http://localhost, trigger an on-demand update check. Deliberately separate from the `default` capability: this is the only permission exposed to page scripts, so the shell/sidecar permissions granted there stay unreachable from the webview.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:*", "http://127.0.0.1:*"]
+  },
+  "permissions": ["allow-check-for-update-now"]
+}

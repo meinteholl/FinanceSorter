@@ -132,6 +132,20 @@
     <p id="goalStatus" class="profile-apikey-status muted small"></p>
   </section>
 
+  {# Only rendered inside the desktop app — a browser tab has no updater. #}
+  <section class="profile-section" id="updateSection" hidden>
+    <h2 class="profile-section-title">Updates</h2>
+    <p class="profile-section-hint muted">
+      De app controleert bij het opstarten automatisch op updates. Heb je die
+      melding weggeklikt, dan kun je hier opnieuw controleren zonder de app
+      te herstarten.
+    </p>
+    <div class="profile-toggle-row">
+      <button type="button" id="checkUpdateBtn" class="btn btn-ghost">Controleer op updates</button>
+      <span id="updateStatus" class="profile-apikey-status muted small"></span>
+    </div>
+  </section>
+
   <form method="post" action="{{ url_for('logout') }}" class="profile-actions">
     <button type="submit" class="btn btn-ghost">Uitloggen</button>
   </form>
@@ -445,6 +459,49 @@
         setStatus('Actief doel: ' + (card.querySelector('.goal-card-title').textContent || goalId) + '.');
       } catch (e) {
         setStatus('Opslaan mislukt: ' + e.message, 'ai-summary-error');
+      }
+    });
+  })();
+
+  // On-demand update check. The startup check only runs once per launch, so
+  // dismissing its dialog leaves no way back to it until the next restart —
+  // this is that way back. The Rust command is reachable because the
+  // `updater-button` capability grants this one command to the local origin;
+  // outside the desktop app there is no bridge, so the section stays hidden.
+  (function () {
+    const section = document.getElementById('updateSection');
+    const btn = document.getElementById('checkUpdateBtn');
+    const status = document.getElementById('updateStatus');
+    if (!section || !btn || !status) return;
+
+    const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+    if (!invoke) return;          // plain browser — nothing to update
+    section.hidden = false;
+
+    function setStatus(text, cls) {
+      status.textContent = text;
+      status.className = 'profile-apikey-status small ' + (cls || 'muted');
+    }
+
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      setStatus('Bezig met controleren…');
+      try {
+        const result = await invoke('check_for_update_now');
+        if (result === 'up-to-date') {
+          setStatus('Je hebt de nieuwste versie.');
+        } else if (result === 'declined') {
+          // They saw the dialog and chose Later; say so rather than nothing.
+          setStatus('Update beschikbaar — niet geïnstalleerd. Klik opnieuw wanneer je zover bent.');
+        } else if (result === 'dev') {
+          setStatus('Updates zijn uitgeschakeld in een ontwikkelbuild.');
+        } else {
+          setStatus('Update gestart…');
+        }
+      } catch (e) {
+        setStatus(String(e && e.message ? e.message : e), 'ai-summary-error');
+      } finally {
+        btn.disabled = false;
       }
     });
   })();

@@ -74,47 +74,77 @@ fn apply_titlebar_colors(_: &WebviewWindow) {}
 //
 // Only compiled into release builds. `cargo tauri dev` skips it so we don't
 // spam GitHub on every reload.
+// Shared by the startup check and the Profiel page's button. Returns a short
+// status the caller can report: whether an update was offered, whether we are
+// already current, or why the check could not run.
 #[cfg(not(debug_assertions))]
-fn check_for_update(app: tauri::AppHandle) {
+async fn run_update_check(app: tauri::AppHandle) -> Result<&'static str, String> {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
     use tauri_plugin_updater::UpdaterExt;
 
-    tauri::async_runtime::spawn(async move {
-        let Ok(updater) = app.updater() else { return };
-        let update = match updater.check().await {
-            Ok(Some(u)) => u,
-            _ => return,
-        };
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Updater niet beschikbaar: {e}"))?;
 
-        let version = update.version.clone();
-        let install = app
-            .dialog()
-            .message(format!(
-                "Versie {version} is beschikbaar. Nu installeren? De app start daarna opnieuw op."
-            ))
-            .title("Update beschikbaar")
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Installeren".into(),
-                "Later".into(),
-            ))
-            .blocking_show();
+    let update = match updater.check().await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Ok("up-to-date"),
+        Err(e) => return Err(format!("Controleren mislukt: {e}")),
+    };
 
-        if !install {
-            return;
-        }
+    let version = update.version.clone();
+    let install = app
+        .dialog()
+        .message(format!(
+            "Versie {version} is beschikbaar. Nu installeren? De app start daarna opnieuw op."
+        ))
+        .title("Update beschikbaar")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Installeren".into(),
+            "Later".into(),
+        ))
+        .blocking_show();
 
-        if update
-            .download_and_install(|_chunk, _total| {}, || {})
-            .await
-            .is_ok()
-        {
+    if !install {
+        return Ok("declined");
+    }
+
+    match update.download_and_install(|_chunk, _total| {}, || {}).await {
+        // Never actually returns — the app restarts into the new version.
+        Ok(_) => {
             app.restart();
         }
+        Err(e) => Err(format!("Installeren mislukt: {e}")),
+    }
+}
+
+// Background update check on launch. Failures are silent — offline / endpoint
+// down shouldn't disrupt the user's session.
+#[cfg(not(debug_assertions))]
+fn check_for_update(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let _ = run_update_check(app).await;
     });
 }
 
 #[cfg(debug_assertions)]
 fn check_for_update(_: tauri::AppHandle) {}
+
+// On-demand check, invoked from the Profiel page. Unlike the startup check
+// this reports back, so the button can say "je hebt al de nieuwste versie"
+// instead of appearing to do nothing.
+#[tauri::command]
+async fn check_for_update_now(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(not(debug_assertions))]
+    {
+        run_update_check(app).await.map(|s| s.to_string())
+    }
+    #[cfg(debug_assertions)]
+    {
+        let _ = app;
+        Ok("dev".to_string())
+    }
+}
 
 fn pick_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind ephemeral port");
@@ -141,6 +171,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![check_for_update_now])
         .manage(SidecarChild(Mutex::new(None)))
         .setup(|app| {
             // Paint the caption to match #fffbf3 before anything else happens —
