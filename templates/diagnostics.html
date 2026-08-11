@@ -180,7 +180,12 @@
         <section id="sec-ai-{{ mode_id }}" class="dash-panel dash-panel-1-3 ai-card" data-mode="{{ mode_id }}">
           <div class="dash-panel-title">
             <span data-tooltip="{{ mode_tip }}">{{ mode_label }}{% if mode_id == 'advice' %} · {{ active_goal.title }}{% endif %}</span>
-            <button type="button" class="dash-panel-btn ai-card-regen" data-mode="{{ mode_id }}" title="Alleen {{ mode_label }} opnieuw genereren" aria-label="{{ mode_label }} opnieuw genereren">↻</button>
+            <span class="ai-card-actions">
+              <button type="button" class="dash-panel-btn ai-card-regen" data-mode="{{ mode_id }}" title="Alleen {{ mode_label }} opnieuw genereren" aria-label="{{ mode_label }} opnieuw genereren">↻</button>
+              <button type="button" class="dash-panel-btn ai-card-speak" data-mode="{{ mode_id }}" title="{{ mode_label }} voorlezen" aria-label="{{ mode_label }} voorlezen">
+                <svg class="ai-speak-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+              </button>
+            </span>
           </div>
           <div class="ai-summary-body ai-card-body">
             {% if _cache %}
@@ -861,6 +866,10 @@
       body.appendChild(p);
     }
 
+    // Assigned by the speech block below. Called whenever a card's text is
+    // about to change so any audio cached for the old text is dropped.
+    let invalidateAudio = function () {};
+
     function showGenerating(body) {
       if (!body) return;
       body.innerHTML = '';
@@ -894,6 +903,7 @@
 
     async function runMode(mode) {
       const body = cardBody(mode);
+      invalidateAudio(mode);
       if (!HAS_KEY) { showMissingKey(body); return { ok: false, mode, error: 'missing-key' }; }
       showGenerating(body);
       try {
@@ -948,6 +958,144 @@
         }
       });
     });
+
+    // Read-out-loud — one speaker button per card, backed by Gemini TTS.
+    // The audio blob is cached per mode for the life of the page so replaying
+    // a card costs nothing; regenerating that card drops its cached audio.
+    (function speech() {
+      const SPEAKER_SVG = '<svg class="ai-speak-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+        + '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>';
+      const STOP_SVG = '<svg class="ai-speak-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+        + '<path d="M6 6h12v12H6z"/></svg>';
+      const LOADING_SVG = '<svg class="ai-speak-icon ai-spinner" viewBox="0 0 24 24" aria-hidden="true">'
+        + '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="14 42" stroke-linecap="round"/></svg>';
+
+      const audioUrls = {};   // mode -> object URL of the fetched WAV
+      let current = null;     // { mode, audio } of whatever is playing
+
+      function speakBtn(mode) {
+        return row.querySelector('.ai-card-speak[data-mode="' + mode + '"]');
+      }
+
+      // Speech failures must not clobber the summary the user is reading, so
+      // this appends a note under the card instead of replacing the body.
+      function showSpeakError(mode, text) {
+        const body = cardBody(mode);
+        if (!body) return;
+        let note = body.querySelector('.ai-speak-error');
+        if (!note) {
+          note = document.createElement('p');
+          note.className = 'ai-summary-error ai-speak-error';
+          body.appendChild(note);
+        }
+        note.textContent = text;
+      }
+
+      function clearSpeakError(mode) {
+        const body = cardBody(mode);
+        const note = body && body.querySelector('.ai-speak-error');
+        if (note) note.remove();
+      }
+
+      function setState(mode, state) {
+        const btn = speakBtn(mode);
+        if (!btn) return;
+        btn.classList.toggle('is-playing', state === 'playing');
+        btn.disabled = state === 'loading';
+        if (state === 'loading') btn.innerHTML = LOADING_SVG;
+        else if (state === 'playing') btn.innerHTML = STOP_SVG;
+        else btn.innerHTML = SPEAKER_SVG;
+      }
+
+      function stopCurrent() {
+        if (!current) return;
+        const { mode, audio } = current;
+        current = null;
+        audio.pause();
+        audio.currentTime = 0;
+        setState(mode, 'idle');
+      }
+
+      // Dropping the object URL forces a fresh fetch next time — used when a
+      // card's text changes underneath us.
+      function invalidate(mode) {
+        if (current && current.mode === mode) stopCurrent();
+        if (audioUrls[mode]) {
+          URL.revokeObjectURL(audioUrls[mode]);
+          delete audioUrls[mode];
+        }
+      }
+
+      async function audioUrlFor(mode) {
+        if (audioUrls[mode]) return audioUrls[mode];
+        const r = await fetch('/api/diagnostics/ai_speak?mode=' + encodeURIComponent(mode) + '&' + periodQueryString(), {
+          method: 'POST',
+        });
+        if (!r.ok) {
+          let msg = 'Voorlezen mislukt (HTTP ' + r.status + ').';
+          try {
+            const data = await r.json();
+            if (data && data.error) msg = data.error;
+          } catch (e) { /* non-JSON error body — keep the generic message */ }
+          throw new Error(msg);
+        }
+        const url = URL.createObjectURL(await r.blob());
+        audioUrls[mode] = url;
+        return url;
+      }
+
+      async function toggle(mode) {
+        // Second click on the card that's talking = stop.
+        if (current && current.mode === mode) { stopCurrent(); return; }
+        stopCurrent();
+
+        clearSpeakError(mode);
+        const card = document.getElementById('sec-ai-' + mode);
+        const hasText = card && card.querySelector('.ai-summary-text');
+        if (!hasText) {
+          showSpeakError(mode, 'Nog niets om voor te lezen — genereer dit inzicht eerst.');
+          return;
+        }
+
+        setState(mode, 'loading');
+        let url;
+        try {
+          url = await audioUrlFor(mode);
+        } catch (e) {
+          setState(mode, 'idle');
+          showSpeakError(mode, e.message);
+          return;
+        }
+
+        const audio = new Audio(url);
+        audio.addEventListener('ended', stopCurrent);
+        audio.addEventListener('error', () => {
+          invalidate(mode);
+          showSpeakError(mode, 'Audio kon niet worden afgespeeld.');
+        });
+        current = { mode, audio };
+        setState(mode, 'playing');
+        try {
+          await audio.play();
+        } catch (e) {
+          stopCurrent();
+          showSpeakError(mode, 'Afspelen geweigerd door de browser: ' + e.message);
+        }
+      }
+
+      row.querySelectorAll('.ai-card-speak').forEach(btn => {
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const m = btn.getAttribute('data-mode');
+          if (m) toggle(m);
+        });
+      });
+
+      // New text for a card means any audio cached for the old text is stale.
+      invalidateAudio = invalidate;
+
+      window.addEventListener('pagehide', stopCurrent);
+    })();
 
     // Phase 5 — auto-generate on a clean period.
     // Conditions (all must hold):

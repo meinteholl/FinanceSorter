@@ -1403,13 +1403,39 @@ a.pp-salary:hover { background: var(--panel-hover); color: var(--text-strong); }
 }
 .ai-card-grid { margin-bottom: 0; }
 .ai-card .dash-panel-title { gap: 6px; }
+.ai-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
 .ai-card-regen {
   font-size: 13px;
   line-height: 1;
   padding: 2px 7px;
   min-width: 0;
 }
+/* Speaker button — matches the regen button's box so the pair reads as one unit */
+.ai-card-speak {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  padding: 2px 7px;
+  min-width: 0;
+}
+.ai-speak-icon {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+.ai-card-speak.is-playing {
+  background: var(--panel-hover);
+  color: var(--text-strong);
+  border-color: var(--rule);
+}
 .ai-card-body { min-height: 6em; }
+.ai-speak-error { margin: 8px 0 0; }
 
 /* "Generating…" state — inline SVG spinner + label */
 .ai-generating {

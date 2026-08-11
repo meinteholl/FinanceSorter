@@ -13,7 +13,7 @@ from functools import wraps
 
 from flask import (
     Flask, render_template, request, redirect, url_for, jsonify, flash, abort,
-    session, g
+    session, g, Response
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -4922,7 +4922,12 @@ def _build_ai_summary_payload(conn, period, goal=None):
     return payload
 
 
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = "gemini-3.6-flash"
+
+# Text-to-speech for the "read this card out loud" buttons. Separate model —
+# the prose models can't emit audio.
+GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
+GEMINI_TTS_VOICE = "Kore"
 
 
 def _ai_summary_period_key(period, mode="digest", goal_id=None):
@@ -5257,6 +5262,135 @@ def api_diagnostics_ai_summary():
     if request.args.get("debug") == "1":
         result["payload_sent"] = payload
     return jsonify(result)
+
+
+# Read out loud — spoken Dutch, so tell the model how to handle the "€1.890"
+# style amounts the prose prompts produce. Prefixed to the cached summary text.
+AI_SPEECH_INSTRUCTION = (
+    "Lees de volgende financiële tekst rustig, duidelijk en in vloeiend "
+    "Nederlands voor. Spreek eurobedragen uit als woorden (\"€1.890\" wordt "
+    "\"achttienhonderdnegentig euro\"). Lees alleen de tekst voor; voeg niets "
+    "toe en laat niets weg.\n\n"
+)
+
+
+def _pcm_to_wav(pcm_bytes, sample_rate, channels):
+    """Wrap raw signed 16-bit little-endian PCM in a WAV container so a browser
+    <audio> element can play it. The TTS model returns bare PCM when the
+    requested container isn't honoured."""
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels or 1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate or 24000)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def _extract_audio_block(interaction):
+    """Walk an Interaction's model_output steps and return the first audio
+    content block, or None. The SDK types the step list as a discriminated
+    union, so attribute access is guarded rather than assumed."""
+    for step in (getattr(interaction, "steps", None) or []):
+        for block in (getattr(step, "content", None) or []):
+            if getattr(block, "type", None) == "audio" and getattr(block, "data", None):
+                return block
+    return None
+
+
+@app.route("/api/diagnostics/ai_speak", methods=["POST"])
+def api_diagnostics_ai_speak():
+    """Speak one AI insight card out loud. Returns audio/wav bytes.
+
+    The text is read from the server-side cache for this (period, mode) rather
+    than from the request body — the client never gets to choose what we send
+    to Google, which keeps the same privacy posture as the summary endpoint.
+    A card that hasn't been generated yet has nothing to read, so that's a 404.
+    """
+    import base64
+
+    try:
+        from google import genai
+    except ImportError:
+        return jsonify({"error": "google-genai is niet geïnstalleerd. Voer uit: pip install google-genai"}), 503
+
+    requested_month = (request.args.get("month") or "").strip()
+    requested_salary = (request.args.get("salary_period") or "").strip()
+    requested_range = (request.args.get("range") or "1m").strip()
+    if requested_range not in RANGE_SIZES:
+        requested_range = "1m"
+
+    mode = (request.args.get("mode") or "digest").strip().lower()
+    if mode not in _AI_MODE_PROMPTS:
+        return jsonify({"error": f"Onbekende modus '{mode}'. Verwacht één van digest, forecast, advice."}), 400
+
+    user = _current_user()
+    user_id = user["id"] if user else None
+
+    with get_connection() as conn:
+        api_key = _get_user_gemini_key(conn, user_id)
+        if not api_key:
+            return jsonify({
+                "error": "Geen Gemini API-sleutel opgeslagen. "
+                         "Voeg er een toe op je Profiel-pagina."
+            }), 400
+
+        period = _resolve_period(conn, requested_month, requested_salary, requested_range)
+        if not period:
+            return jsonify({"error": "Geen periode geselecteerd."}), 400
+
+        goal_id = _get_user_active_goal_id(conn, user_id) if mode == "advice" else None
+        cached = _load_cached_ai_summary(conn, period, mode=mode, goal_id=goal_id)
+
+    text = ((cached or {}).get("summary") or "").strip()
+    if not text:
+        return jsonify({"error": "Nog niets om voor te lezen — genereer dit inzicht eerst."}), 404
+
+    try:
+        client = genai.Client(api_key=api_key)
+        interaction = client.interactions.create(
+            model=GEMINI_TTS_MODEL,
+            input=AI_SPEECH_INSTRUCTION + text,
+            response_format={
+                "type": "audio",
+                "mime_type": "audio/wav",
+                "delivery": "inline",
+            },
+            generation_config={
+                "speech_config": [{"voice": GEMINI_TTS_VOICE, "language": "nl-NL"}],
+            },
+        )
+    except Exception as e:
+        return jsonify({"error": f"Gemini-spraakaanroep mislukt: {e.__class__.__name__}: {e}"}), 502
+
+    block = _extract_audio_block(interaction)
+    if block is None:
+        return jsonify({"error": "Gemini gaf geen audio terug."}), 502
+
+    try:
+        audio = base64.b64decode(block.data)
+    except Exception:
+        return jsonify({"error": "Audio van Gemini kon niet worden gedecodeerd."}), 502
+
+    # audio/wav already carries its own header; audio/l16 is bare PCM and needs one.
+    if (getattr(block, "mime_type", "") or "").lower() != "audio/wav":
+        audio = _pcm_to_wav(
+            audio,
+            getattr(block, "sample_rate", None) or 24000,
+            getattr(block, "channels", None) or 1,
+        )
+
+    return Response(
+        audio,
+        mimetype="audio/wav",
+        headers={
+            "Content-Length": str(len(audio)),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.route("/api/diagnostics/category_pie")
