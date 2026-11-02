@@ -58,7 +58,7 @@ fn save_config(app: &AppHandle, config: &AppConfig) {
 ///
 /// A port is deliberately *not* treated as evidence of scheme. App Hub exposes
 /// each app over TLS at `https://<host>:<local port + 5000>`, so the tailnet
-/// address that matters here — `mei.tail05140d.ts.net:10001` — is HTTPS despite
+/// address that matters here — `pi.tail1a2b3c.ts.net:10001` — is HTTPS despite
 /// carrying a port. Keying off the colon (as the sibling Mei desktop wrapper
 /// does) sends exactly that address to http, where nothing answers.
 ///
@@ -366,20 +366,20 @@ mod tests {
         // for http (as the sibling Mei wrapper does) sends the real address to
         // a port where nothing is listening.
         assert_eq!(
-            base_url("mei.tail05140d.ts.net:10001"),
-            "https://mei.tail05140d.ts.net:10001"
+            base_url("pi.tail1a2b3c.ts.net:10001"),
+            "https://pi.tail1a2b3c.ts.net:10001"
         );
     }
 
     #[test]
     fn bare_dns_names_are_https() {
-        assert_eq!(base_url("mei.tail05140d.ts.net"), "https://mei.tail05140d.ts.net");
+        assert_eq!(base_url("pi.tail1a2b3c.ts.net"), "https://pi.tail1a2b3c.ts.net");
     }
 
     #[test]
     fn ip_literals_and_local_names_are_http() {
-        assert_eq!(base_url("192.168.1.98:5001"), "http://192.168.1.98:5001");
-        assert_eq!(base_url("192.168.1.98"), "http://192.168.1.98");
+        assert_eq!(base_url("192.168.1.42:5001"), "http://192.168.1.42:5001");
+        assert_eq!(base_url("192.168.1.42"), "http://192.168.1.42");
         assert_eq!(base_url("localhost:5004"), "http://localhost:5004");
         assert_eq!(base_url("raspberrypi.local"), "http://raspberrypi.local");
         assert_eq!(base_url("RaspberryPi.Local"), "http://RaspberryPi.Local");
@@ -387,8 +387,8 @@ mod tests {
 
     #[test]
     fn whitespace_is_tolerated() {
-        assert_eq!(base_url("  mei.tail05140d.ts.net:10001  "),
-                   "https://mei.tail05140d.ts.net:10001");
+        assert_eq!(base_url("  pi.tail1a2b3c.ts.net:10001  "),
+                   "https://pi.tail1a2b3c.ts.net:10001");
     }
 
     #[test]
