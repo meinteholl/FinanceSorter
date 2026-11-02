@@ -8,10 +8,20 @@ from datetime import datetime
 def _resolve_data_dir() -> Path:
     """Where to keep the SQLite file.
 
+    FINANCE_DATA_DIR wins when set. It is not needed for the normal App Hub
+    install — the unfrozen branch below already resolves relative to this file,
+    which lands on apps/<name>/data/ and satisfies the hub's persistence
+    contract — but it lets a second staging copy of the app run against a copy
+    of the database, and lets the DB move off the SD card later without a code
+    change.
+
     Frozen by PyInstaller → %APPDATA%\\FinanceSorter (Program Files is read-only
     for normal users, so we cannot put the DB next to the .exe). Dev mode keeps
     the existing ./data/ next to the source so nothing about run.bat changes.
     """
+    override = os.environ.get("FINANCE_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
     if getattr(sys, "frozen", False):
         appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return Path(appdata) / "FinanceSorter"
@@ -198,9 +208,19 @@ CREATE INDEX IF NOT EXISTS idx_corrections_signal
 
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # Served threaded, so concurrent connections are normal: a background model
+    # download writing `users`, a categorisation sweep holding a connection for
+    # minutes, the TTS route opening a second connection while its response is
+    # still streaming, and (on the Pi) the read-only API polling on its own
+    # schedule. Without a busy timeout any overlap is an immediate
+    # "database is locked".
+    conn.execute("PRAGMA busy_timeout = 5000")
+    # Pairs with WAL: fsync only at checkpoints. Much kinder to an SD card, and
+    # only a power cut — not an app crash — can cost the last transactions.
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -210,6 +230,12 @@ def _column_exists(conn, table, column):
 
 def init_db():
     with get_connection() as conn:
+        # Set once, here, rather than per-connection: the journal mode lives in
+        # the file header so it persists, and `PRAGMA journal_mode=WAL` can block
+        # when another connection holds a lock — not something to pay for on
+        # every request. WAL is what stops a reader from queueing behind a writer.
+        conn.execute("PRAGMA journal_mode = WAL")
+
         conn.executescript(SCHEMA)
 
         # Repair transactions whose date got stored as DD-MM-YYYY or DD/MM/YYYY

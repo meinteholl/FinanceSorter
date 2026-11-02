@@ -18,8 +18,8 @@ Two properties are deliberate:
   — which is precisely the data categorization needs. Keeping inference on
   localhost is what makes the feature possible at all.
 
-No third-party dependencies: stdlib urllib only, so finance-sorter-backend.spec
-and requirements.txt are unaffected.
+No third-party dependencies: stdlib urllib only, so requirements.txt — and the
+install step App Hub runs from it — are unaffected.
 """
 
 import functools
@@ -110,6 +110,19 @@ RECOMMENDED_MODELS = [
     (3500, "qwen3.5:2b",   2700000000),
     (0,    "qwen3.5:0.8b", 1000000000),
 ]
+
+
+def is_loopback_url(url):
+    """Is this Ollama running on the same machine as us?
+
+    Matters because detect_vram_mb() inspects *our* GPU. When Ollama is on
+    another host — the normal arrangement once the backend runs on a Pi — a
+    local VRAM reading says nothing about where inference actually happens, and
+    presenting it as if it did is worse than staying quiet.
+    """
+    host = (url or "").split("//", 1)[-1].split("/", 1)[0].rsplit(":", 1)[0]
+    host = host.strip("[]").lower()
+    return host in ("localhost", "127.0.0.1", "::1", "")
 
 
 def recommend_model(vram_mb=None):

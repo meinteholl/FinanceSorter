@@ -16,6 +16,21 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 
+# Session signing key, generated on first run and cached beside the database.
+data/.secret_key
+
+# App Hub bundles, rebuilt by _build_zip.py on demand (one per install)
+finance-*.zip
+
+# SSH credentials for the Pi. SetupGithub.bat runs `git add -A`, so this needs
+# to be ignored rather than merely untracked.
+Connect to Pi info.txt
+
+# App Hub's own developer guide, kept here only as a working reference. It
+# documents the Pi's SSH user, tailnet hostname and the hub's SSO secret, and
+# this repository is public.
+APP-GUIDE.md
+
 # Tauri / Rust
 src-tauri/target/
 src-tauri/gen/schemas/

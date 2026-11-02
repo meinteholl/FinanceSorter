@@ -5,3 +5,8 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+
+# The mirror image on the Pi: a shell script with CRLF fails at exec time with
+# "bad interpreter: /usr/bin/env bash^M". App Hub runs setup.sh and run.sh
+# directly, so these must stay LF whatever the checkout platform.
+*.sh text eol=lf

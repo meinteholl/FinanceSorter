@@ -9,6 +9,11 @@ if not exist ".venv\Scripts\python.exe" (
     if errorlevel 1 exit /b 1
 )
 
+rem Dev convenience only: enables the reloader and the traceback console.
+rem Never set on the Pi -- App Hub supervises restarts, and an interactive
+rem debugger on a reachable port is a remote shell.
+set FINANCE_DEBUG=1
+
 echo [run] Starting Finance Sorter on http://127.0.0.1:5004
 start "" http://127.0.0.1:5004
 ".venv\Scripts\python.exe" app.py
