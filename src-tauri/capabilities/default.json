@@ -1,27 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Allow the main window to spawn the bundled Flask sidecar",
+  "description": "Window setup: the bundled page that asks where Finance Sorter lives, probes it, and remembers the answer. No shell access — the backend is no longer a child process of this app, so nothing here may spawn one.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:default",
     "updater:default",
-    "shell:allow-execute",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [
-        {
-          "name": "binaries/finance-sorter-backend",
-          "sidecar": true,
-          "args": [
-            "--port",
-            { "validator": "^\\d{2,5}$" },
-            "--parent-pid",
-            { "validator": "^\\d{1,10}$" }
-          ]
-        }
-      ]
-    }
+    "allow-get-host",
+    "allow-resolve-url",
+    "allow-probe-host",
+    "allow-set-host",
+    "allow-open-stored",
+    "allow-show-config"
   ]
 }

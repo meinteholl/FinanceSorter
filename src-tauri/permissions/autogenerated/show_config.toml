@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-show-config"
+description = "Enables the show_config command without any pre-configured scope."
+commands.allow = ["show_config"]
+
+[[permission]]
+identifier = "deny-show-config"
+description = "Denies the show_config command without any pre-configured scope."
+commands.deny = ["show_config"]

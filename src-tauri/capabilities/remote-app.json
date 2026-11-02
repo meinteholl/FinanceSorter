@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "remote-app",
+  "description": "The two things the app's own pages may ask of the shell once the webview is on the remote origin: check for an update, and escape back to the setup screen. Deliberately separate from `default` so nothing else granted there is reachable from a page served over the network.",
+  "windows": ["main"],
+  "remote": {
+    "urls": [
+      "https://*.ts.net:*",
+      "http://192.168.*.*:*",
+      "http://localhost:*",
+      "http://127.0.0.1:*"
+    ]
+  },
+  "permissions": [
+    "allow-check-for-update-now",
+    "allow-show-config"
+  ]
+}

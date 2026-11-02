@@ -1,7 +1,7 @@
 [package]
 name = "finance-sorter"
-version = "0.1.12"
-description = "Local desktop wrapper around the Flask-based Finance Sorter"
+version = "0.2.0"
+description = "Desktop window for a Finance Sorter running on the network"
 edition = "2021"
 rust-version = "1.77"
 
@@ -14,11 +14,14 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Health probe against the Pi before we navigate the webview at it. rustls
+# rather than the platform TLS stack so the bundled roots travel with the
+# installer and the probe cannot disagree with itself across machines.
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 
 [profile.release]
 panic = "abort"
