@@ -66,6 +66,18 @@
     <div class="page-head">
       <h1 class="page-title">Transacties</h1>
       <div class="page-head-right">
+        {# Dragging a file onto the page is the quicker route on a desktop, but
+           it is not available at all on a phone — and the app is reachable from
+           one now that the backend lives on the Pi. Same endpoint, submitted
+           the moment a file is chosen. #}
+        <form method="post" action="{{ url_for('upload') }}"
+              enctype="multipart/form-data" class="import-form">
+          <label class="head-action import-label">
+            CSV importeren
+            <input type="file" name="file" accept=".csv" hidden
+                   onchange="this.form.submit()">
+          </label>
+        </form>
         {% if selected_date %}
           <a href="{{ url_for('transactions') }}" class="filter-chip" title="Dagfilter wissen">
             Dag · {{ selected_date }}

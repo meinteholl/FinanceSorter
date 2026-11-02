@@ -1223,6 +1223,13 @@
     fd.append("file", file);
     try {
       const resp = await fetch("/upload", { method: "POST", body: fd, redirect: "follow" });
+      // The server caps request bodies, and a 413 comes back as a plain error
+      // response rather than a redirect — without this branch the page just
+      // navigates to /transactions and the import appears to vanish.
+      if (resp.status === 413) {
+        alert("Dit bestand is te groot om te importeren. Bankafschriften zijn normaal een paar honderd kilobyte — klopt het dat je een CSV-export sleept?");
+        return;
+      }
       window.location.href = resp.redirected ? resp.url : "/transactions";
     } catch (err) {
       alert("Uploaden mislukt: " + (err && err.message ? err.message : err));
@@ -1915,4 +1922,19 @@
     ev.preventDefault();
     row.scrollLeft += delta;
   }, { passive: false });
+})();
+
+// ----- Desktop shell: escape hatch back to the setup screen -----
+// Only meaningful inside the Tauri window. Once the webview is on the remote
+// origin and the Pi disappears mid-session, WebView2 shows its own error page
+// and no Tauri event fires — so the only way back to "which host?" is one the
+// user can trigger. Browsers see no window.__TAURI__ and skip this entirely.
+(function () {
+  if (!window.__TAURI__) return;
+  document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && (e.key === "H" || e.key === "h")) {
+      e.preventDefault();
+      window.__TAURI__.core.invoke("show_config").catch(() => {});
+    }
+  });
 })();

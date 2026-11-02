@@ -64,11 +64,13 @@
     <h2 class="profile-section-title">Lokaal model voor categorieën</h2>
     <p class="profile-section-hint muted">
       Stelt categorieën voor bij transacties waar nog geen regel of geschiedenis
-      voor bestaat. Draait volledig op je eigen machine via
+      voor bestaat. Draait op je eigen hardware via
       <a href="https://ollama.com" target="_blank" rel="noopener">Ollama</a> — anders
       dan de Gemini-samenvatting krijgt dit model de naam en tegenpartij wél te
-      zien, want zonder die gegevens valt er niets te categoriseren. Er verlaat
-      niets je computer. Suggesties worden nooit automatisch toegepast; je
+      zien, want zonder die gegevens valt er niets te categoriseren. Wijst de URL
+      hieronder naar een andere computer, dan reizen die gegevens daarnaartoe:
+      nog steeds je eigen apparaten, maar niet meer alleen deze. Er gaat niets
+      naar een externe dienst. Suggesties worden nooit automatisch toegepast; je
       bevestigt ze zelf op de Transacties-pagina.
     </p>
 
@@ -77,7 +79,7 @@
              id="llmUrl"
              class="profile-apikey-input"
              value="{{ llm.url }}"
-             placeholder="http://127.0.0.1:11434"
+             placeholder="{{ llm_url_default }}"
              autocomplete="off"
              spellcheck="false"
              aria-label="Ollama-adres">
@@ -267,17 +269,27 @@
     // spills into system RAM and crawls. 0.75 leaves room for both.
     const VRAM_HEADROOM = 0.75;
     let vramMb = null;
+    // The backend reads VRAM from its own machine. Once Ollama lives on another
+    // host that number describes the wrong computer, so we stop using it rather
+    // than dress a local reading up as a remote one.
+    let remote = false;
 
     const gb = (bytes) => (bytes / 1073741824).toFixed(1) + ' GB';
 
     function tooBig(sizeBytes) {
-      if (!vramMb || !sizeBytes) return false;
+      if (remote || !vramMb || !sizeBytes) return false;
       return sizeBytes / 1048576 > vramMb * VRAM_HEADROOM;
     }
 
     function describeFit() {
+      if (remote) {
+        vramEl.textContent = 'Ollama draait op een andere machine, dus hier is niet te zien hoeveel videogeheugen die heeft — kies een model dat op díe computer past.';
+        vramEl.className = 'profile-section-hint muted small';
+        return;
+      }
       if (!vramMb) {
         vramEl.textContent = 'Geen NVIDIA-kaart gedetecteerd — kies zelf een model dat in je videogeheugen past.';
+        vramEl.className = 'profile-section-hint muted small';
         return;
       }
       const gbTotal = Math.round(vramMb / 1024);
@@ -310,6 +322,7 @@
         const r = await fetch('{{ url_for("api_profile_llm_probe") }}?url=' + encodeURIComponent(urlInput.value.trim()));
         const data = await r.json();
         vramMb = data.vram_mb || null;
+        remote = !!data.remote;
         if (!data.ok) {
           setStatus(data.error || 'Ollama niet bereikbaar.', 'ai-summary-error');
           describeFit();

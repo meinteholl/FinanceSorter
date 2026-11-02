@@ -2,11 +2,12 @@ import csv
 import io
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
 from calendar import monthrange
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from collections import defaultdict, Counter
 
 from functools import wraps
@@ -17,7 +18,7 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from db import init_db, get_connection
+from db import init_db, get_connection, DB_PATH
 import llm_categorize
 
 
@@ -33,14 +34,130 @@ if getattr(sys, "frozen", False):
     )
 else:
     app = Flask(__name__)
-app.secret_key = "ing-finance-sorter-local"
+
+
+def _load_secret_key():
+    """Key that signs the session cookie.
+
+    Precedence: FINANCE_SECRET_KEY (an App Hub Variable) -> a generated key
+    cached in the data directory -> a fresh one written there on first run.
+
+    The cached file lives beside the database rather than next to the source
+    because data/ is already the state directory and is already excluded from
+    the deploy zip wholesale — excluded by construction beats excluded by
+    remembering to add it to an allow-list.
+
+    Deliberately does NOT fall back to APPHUB_AUTH_SECRET. This app signs its
+    own cookie rather than merely reading the hub's, so coupling the two key
+    materials would only mean rotating one logs you out of the other.
+    """
+    env_key = os.environ.get("FINANCE_SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    key_path = DB_PATH.parent / ".secret_key"
+    try:
+        cached = key_path.read_text(encoding="utf-8").strip()
+        if cached:
+            return cached
+    except OSError:
+        pass
+
+    key = secrets.token_hex(32)
+    try:
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_text(key, encoding="utf-8")
+        os.chmod(key_path, 0o600)
+    except OSError:
+        # Read-only data dir: fall through with a process-lifetime key. Sessions
+        # won't survive a restart, but the app still runs.
+        pass
+    return key
+
+
+app.secret_key = _load_secret_key()
+
+
+def _default_cookie_name():
+    """A session cookie name unique to this install.
+
+    Cookies are scoped by hostname, not by port, so two installs of this app on
+    one Pi would otherwise both write the same name under different signing keys
+    and quietly invalidate each other's logins — which presents as two people
+    logging each other out at random.
+
+    App Hub runs each app from `apps/<name>/`, so the working directory is a
+    stable per-install discriminator that cannot be forgotten the way a Variable
+    can. Renaming or reinstalling an app changes it, which logs that install out
+    once — correct, since it really is a different install.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", os.path.basename(os.getcwd()).lower()).strip("_")
+    return f"session_{slug}" if slug else "finance_session"
+
+
+app.config.update(
+    # Cookies are not scoped by port: every app on this host shares one jar keyed
+    # by hostname. Mei and Salus both write Flask's default `session` cookie on
+    # the Pi's tailnet hostname, signed with their own keys — so sharing the name
+    # means each app silently invalidates the others' sessions on every write.
+    # Worse, Mei marks its cookie Secure, and a plain-HTTP origin may not
+    # overwrite a Secure cookie of the same name (RFC6265bis "leave secure
+    # cookies alone") — which presents as an unexplained redirect loop to /login.
+    #
+    # The same applies to a *second copy of this app*: one install per person on
+    # one Pi, both writing the same cookie name under different signing keys,
+    # each silently invalidating the other's login. Hence _default_cookie_name(),
+    # which derives it per install rather than trusting anyone to remember a
+    # variable. FINANCE_COOKIE_NAME still overrides.
+    SESSION_COOKIE_NAME=(
+        os.environ.get("FINANCE_COOKIE_NAME", "").strip() or _default_cookie_name()
+    ),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # Secure by default. Browsers treat localhost as a secure context, so this
+    # is fine for `python app.py` and for the desktop shell on 127.0.0.1
+    # (verified: the cookie is set and survives a reload over plain http there).
+    # It is only a problem on a plain-HTTP *remote* origin — the raw
+    # http://<host>:<port> App Hub port rather than its HTTPS endpoint — where
+    # the cookie is silently dropped and login never sticks with no error
+    # anywhere. Set FINANCE_COOKIE_INSECURE=1 if you must serve that way.
+    SESSION_COOKIE_SECURE=(
+        os.environ.get("FINANCE_COOKIE_INSECURE", "").strip().lower()
+        not in ("1", "true", "yes")
+    ),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+    # /upload reads the whole body into memory before parsing. Unbounded, that is
+    # an OOM on a small-RAM Pi the moment the app is reachable off-device. The
+    # restore route raises this per-request; see _restore_body_limit.
+    MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+)
+
+# A restored database is the whole file, not a statement export, so it needs far
+# more headroom than a CSV. Raising it per-request keeps the tight cap on every
+# other route. Flask 3.1+ / Werkzeug 3.1+ only.
+RESTORE_MAX_BYTES = 128 * 1024 * 1024
+
+
+@app.before_request
+def _restore_body_limit():
+    if request.endpoint == "restore":
+        request.max_content_length = RESTORE_MAX_BYTES
+    return None
 
 
 # ---------- auth ----------
 
 # Endpoints reachable without a logged-in session. Static assets and the auth
-# pages themselves must stay open or the user can never reach them.
-PUBLIC_ENDPOINTS = {"login", "signup", "logout", "static", "health"}
+# pages themselves must stay open or the user can never reach them. `restore` is
+# pre-auth by necessity — it is how you get an account in the first place — and
+# guards itself with the same first-run window signup uses.
+PUBLIC_ENDPOINTS = {"login", "signup", "logout", "restore", "static", "health"}
+
+# Versioned, unlike the app's own /api/* routes, because those namespaces are
+# already taken (/api/summary, /api/profile/*, /api/llm/*, /api/diagnostics/*,
+# /api/rules/*, /api/transactions/*) and because a consumer living in another
+# process needs shapes it can rely on across a deploy.
+API_PREFIX = "/api/v1/"
 
 
 def _current_user():
@@ -73,6 +190,14 @@ def login_required(view):
 
 @app.before_request
 def _require_auth():
+    # The read-only API authenticates with a key, not a cookie — see
+    # api_key_required, which every route under this prefix carries. Matched by
+    # path rather than by listing endpoint names, so a newly added /api/v1 route
+    # cannot quietly be left off the list and get redirected to the login page
+    # instead: a JSON client would report that as a parse error, which looks
+    # nothing like the auth problem it actually is.
+    if request.path.startswith(API_PREFIX):
+        return None
     if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint is None:
         return None
     if _current_user() is None:
@@ -1004,9 +1129,35 @@ def _load_llm_suggestions(conn, rows):
     return out
 
 
+def _default_llm_url():
+    """Where to look for Ollama when the user has not chosen a host.
+
+    The built-in default is loopback, which is right on a desktop and always
+    wrong on the Pi — nothing serves a model there. FINANCE_OLLAMA_URL lets each
+    install point at its own owner's machine once, as an App Hub Variable,
+    instead of every person having to find the field on the Profiel page before
+    categorisation works at all.
+    """
+    return os.environ.get("FINANCE_OLLAMA_URL", "").strip() or llm_categorize.DEFAULT_URL
+
+
+def _resolve_llm_url(stored):
+    """The effective Ollama URL for a stored per-user value.
+
+    A stored value wins, except when it is still the schema's factory loopback
+    default — that is indistinguishable from "never touched", and on the Pi it
+    can only mean the latter. Anyone who genuinely wants loopback there can say
+    so with FINANCE_OLLAMA_URL.
+    """
+    stored = (stored or "").strip()
+    if stored and stored != llm_categorize.DEFAULT_URL:
+        return stored
+    return _default_llm_url()
+
+
 def _get_user_llm_settings(conn, user_id):
     """Local-model settings for the user, with defaults for a missing row."""
-    defaults = {"enabled": False, "model": "", "url": llm_categorize.DEFAULT_URL}
+    defaults = {"enabled": False, "model": "", "url": _default_llm_url()}
     if not user_id:
         return defaults
     try:
@@ -1021,7 +1172,7 @@ def _get_user_llm_settings(conn, user_id):
     return {
         "enabled": bool(row["llm_enabled"]),
         "model": (row["llm_model"] or "").strip(),
-        "url": (row["llm_url"] or "").strip() or llm_categorize.DEFAULT_URL,
+        "url": _resolve_llm_url(row["llm_url"]),
     }
 
 
@@ -1157,7 +1308,114 @@ def signup():
     return render_template("signup.html", name="", email="")
 
 
-@app.route("/logout", methods=["POST", "GET"])
+RESTORE_REQUIRED_TABLES = ("users", "transactions", "categories", "topics")
+
+
+def _validate_uploaded_db(path):
+    """Is `path` a usable Finance Sorter database? Returns None, or a message.
+
+    Opened read-only: a malformed file should never get the chance to be written
+    to. Everything is checked before the live database is touched at all, so a
+    rejected upload leaves the existing data exactly as it was.
+    """
+    try:
+        src = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return "Dit bestand kon niet als database geopend worden."
+
+    try:
+        try:
+            result = src.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.DatabaseError:
+            return "Dit is geen SQLite-database."
+        if not result or result[0] != "ok":
+            return "De database is beschadigd en is niet geladen."
+
+        present = {
+            r[0] for r in src.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        missing = [t for t in RESTORE_REQUIRED_TABLES if t not in present]
+        if missing:
+            return (
+                "Dit lijkt geen Finance Sorter-database — de tabel(len) "
+                f"{', '.join(missing)} ontbreken."
+            )
+
+        # Without an account the restore would succeed and still leave you at a
+        # login you cannot pass, with signup closed behind you.
+        if src.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None:
+            return "Deze database bevat geen account, dus je zou niet kunnen inloggen."
+    finally:
+        src.close()
+
+    return None
+
+
+@app.route("/restore", methods=["POST"])
+def restore():
+    """Load an existing finance.db, before the first account exists.
+
+    Same first-run window as signup: open until this install has a user, then
+    closed forever. That makes the two ways of claiming a fresh install — create
+    an account, or bring your own database — symmetrical, and means the section
+    disappears from the login page the moment either one succeeds.
+
+    Uses sqlite3's backup API rather than replacing the file. Copying bytes over
+    a live database leaves its -wal and -shm behind, and a stale WAL beside a
+    replaced main database is corruption; backup() copies into the open
+    connection instead, so that failure mode does not exist here.
+    """
+    if _signup_locked():
+        abort(403)
+
+    file = request.files.get("database")
+    if not file or not file.filename:
+        flash("Kies een databasebestand.", "error")
+        return redirect(url_for("login"))
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DB_PATH.parent / f".restore-{secrets.token_hex(8)}.db"
+
+    try:
+        file.save(tmp)
+
+        problem = _validate_uploaded_db(tmp)
+        if problem:
+            flash(problem, "error")
+            return redirect(url_for("login"))
+
+        src = sqlite3.connect(f"{tmp.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            with get_connection() as dst:
+                src.backup(dst)
+        finally:
+            src.close()
+    except OSError as e:
+        flash(f"Het bestand kon niet worden gelezen: {e}", "error")
+        return redirect(url_for("login"))
+    except sqlite3.Error as e:
+        flash(f"De database kon niet worden geladen: {e}", "error")
+        return redirect(url_for("login"))
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # The uploaded database may predate the current schema, so run the migrations
+    # over it before anyone gets a chance to query a column that isn't there yet.
+    init_db()
+
+    flash("Database geladen. Log in met je bestaande wachtwoord.", "success")
+    return redirect(url_for("login"))
+
+
+# POST only. On loopback a GET logout was harmless; reachable over a network it
+# means any page that can talk the browser into a request — an <img src="/logout">
+# is enough — can sign you out. The only caller is already a form (profile.html).
+@app.route("/logout", methods=["POST"])
 def logout():
     session.clear()
     return redirect(url_for("login"))
@@ -1180,6 +1438,7 @@ def profile():
         active_goal_id=active_goal_id,
         auto_generate_ai=auto_generate_ai,
         llm=llm,
+        llm_url_default=_default_llm_url(),
         gemini_key_hint=_mask_key(gemini_key),
     )
 
@@ -1258,7 +1517,7 @@ def api_profile_llm():
 
     enabled = 1 if bool(body.get("enabled")) else 0
     model = (body.get("model") or "").strip()
-    url = (body.get("url") or "").strip() or llm_categorize.DEFAULT_URL
+    url = (body.get("url") or "").strip() or _default_llm_url()
 
     if not url.startswith("http://") and not url.startswith("https://"):
         return jsonify({"error": "URL moet met http:// of https:// beginnen."}), 400
@@ -1389,20 +1648,30 @@ def api_profile_llm_probe():
     """
     if not _current_user():
         return jsonify({"error": "Niet ingelogd."}), 401
-    url = (request.args.get("url") or "").strip() or llm_categorize.DEFAULT_URL
+    url = (request.args.get("url") or "").strip() or _default_llm_url()
     if not url.startswith("http://") and not url.startswith("https://"):
         return jsonify({"ok": False, "models": [], "error": "Ongeldige URL."})
     result = llm_categorize.probe(url)
     # Carried alongside the model list so the UI can offer a download without a
     # second round trip when nothing is installed yet.
     result["recommended"] = llm_categorize.recommend_model(result.get("vram_mb"))
+    # vram_mb is read from *this* machine. Pointed at another host it describes
+    # the wrong computer, so tell the UI to stop drawing conclusions from it
+    # rather than let it recommend the smallest model to someone whose remote
+    # box has a 24 GB card.
+    result["remote"] = not llm_categorize.is_loopback_url(url)
     return jsonify(result)
 
 
 # How many distinct merchant keys one sweep request handles. The client loops
-# until done, which keeps each request short (Flask's dev server handles one at
-# a time) and gives the progress bar something to move on.
-LLM_SWEEP_BATCH = 6
+# until done, which keeps each request short and gives the progress bar
+# something to move on.
+#
+# Three rather than six because the model now lives on another machine: at
+# CLASSIFY_TIMEOUT (60s) a batch of six could legitimately hold a request open
+# for six minutes, past the idle timeout of most proxies sitting between the
+# browser and the backend. Half the batch, half the worst case.
+LLM_SWEEP_BATCH = 3
 
 
 @app.route("/api/categorize/llm", methods=["POST"])
@@ -4832,6 +5101,40 @@ def _compute_day_of_period_distribution(conn, period):
     }
 
 
+def _data_freshness(conn):
+    """How current is the data, and how much of it is there?
+
+    Transactions only ever arrive by hand, through a CSV import — there is no
+    bank connection and nothing on a schedule. So "this month" can legitimately
+    be empty for a fortnight, and a consumer that doesn't know that will report
+    a quiet month as a frugal one. Every answer carries this block so the
+    difference is always visible.
+    """
+    latest, earliest, total = conn.execute(
+        "SELECT MAX(date), MIN(date), COUNT(*) FROM transactions"
+    ).fetchone()
+
+    days_stale = None
+    if latest:
+        try:
+            days_stale = (date.today() - date.fromisoformat(latest)).days
+        except ValueError:
+            pass
+
+    months = conn.execute(
+        "SELECT COUNT(DISTINCT substr(date, 1, 7)) FROM transactions"
+    ).fetchone()[0]
+
+    return {
+        "latest_transaction": latest,
+        "earliest_transaction": earliest,
+        "days_stale": days_stale,
+        "newest_month": latest[:7] if latest else None,
+        "months_available": months,
+        "total_transactions": total,
+    }
+
+
 def _build_ai_summary_payload(conn, period, goal=None):
     """Aggregate the period into a JSON-safe payload, structured by topic with
     categories nested. Never sends raw transaction free-text (name,
@@ -4894,6 +5197,8 @@ def _build_ai_summary_payload(conn, period, goal=None):
         for m in diag["mom"][:8]
     ]
 
+    fixed_var = diag["fixed_var"]
+
     payload = {
         "period_label": diag["period_label"],
         "period_mode": diag["period_mode"],
@@ -4903,6 +5208,16 @@ def _build_ai_summary_payload(conn, period, goal=None):
         "net": round(diag["net"], 2),
         "savings_rate": (round(diag["savings_rate"], 3)
                          if diag["savings_rate"] is not None else None),
+        # Nothing here comes from outside the app, so a reader has no way to tell
+        # a quiet month from a month that simply hasn't been imported yet. Say so
+        # explicitly rather than let a consumer present stale figures as current.
+        "data_freshness": dict(_data_freshness(conn), tx_in_period=diag["tx_count"]),
+        "fixed_costs": {
+            "fixed": round(fixed_var["fixed"], 2),
+            "variable": round(fixed_var["variable"], 2),
+            "fixed_pct": round(fixed_var["fixed_pct"], 1),
+            "topics": fixed_var["fixed_categories"],
+        },
         "by_topic": by_topic,
         "vs_prior_topic": vs_prior_period,
         "uncategorized_pct": round(diag["uncat_pct"], 1),
@@ -5791,109 +6106,488 @@ def health():
     return jsonify(ok=True)
 
 
-def _parse_int_flag(name: str) -> int | None:
-    """Pull `--name N` or `--name=N` out of sys.argv. Returns None if absent."""
-    argv = sys.argv[1:]
-    for i, a in enumerate(argv):
-        if a == name and i + 1 < len(argv):
-            try:
-                return int(argv[i + 1])
-            except ValueError:
-                return None
-        prefix = name + "="
-        if a.startswith(prefix):
-            try:
-                return int(a.split("=", 1)[1])
-            except ValueError:
-                return None
-    return None
+# ----- Read-only API ---------------------------------------------------------
+
+# A key-authenticated, read-only view of the same figures the Diagnostiek page
+# shows, for callers that are not a browser — specifically the Mei assistant
+# running beside this app on the same Pi. It sits outside the normal login flow
+# deliberately: those routes answer a session cookie, and a server-side caller
+# has none. Nothing here mutates anything; every write still goes through the
+# cookie-authenticated routes above.
+#
+# Setup: App Hub injects FINANCE_API_KEY. With the variable unset the whole API
+# stays off (503) rather than falling open. Read once at import, so changing the
+# variable needs an app restart.
+_API_KEY = os.environ.get("FINANCE_API_KEY", "")
+
+_API_RANGES = ("1m", "3m", "6m", "12m")
+_API_MAX_MONTHS = 24
+_API_MAX_DAYS = 366
+_API_TX_LIMIT_DEFAULT = 20
+_API_TX_LIMIT_MAX = 100
 
 
-def _parse_port() -> int:
-    # Tauri picks a free port and passes --port; dev mode keeps 5004.
-    return _parse_int_flag("--port") or 5004
+def _api_error(message, status, **extra):
+    """Errors always carry `error`; `extra` is for echoing back valid values.
 
-
-def _make_parent_alive_probe(parent_pid: int):
-    """Return a no-arg callable that returns True while the parent is alive.
-
-    Windows: OpenProcess(QUERY_LIMITED_INFORMATION) + GetExitCodeProcess; the
-    process is alive iff its exit code is STILL_ACTIVE (259). We can't use
-    os.kill(pid, 0) here — on Windows that maps to TerminateProcess / CTRL_C
-    semantics, not a POSIX-style liveness probe, and raises OSError even when
-    the process is alive.
-
-    POSIX: os.kill(pid, 0) is the canonical liveness check.
+    Telling a language model which values exist is what lets it correct itself
+    instead of guessing again — and the topic names here are the user's own
+    invented Dutch labels, which no caller could reasonably guess.
     """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-        def alive() -> bool:
-            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, parent_pid)
-            if not h:
-                return False
-            try:
-                code = wintypes.DWORD()
-                if not kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
-                    return False
-                return code.value == STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(h)
-        return alive
-
-    def alive() -> bool:
-        import os
-        try:
-            os.kill(parent_pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True  # process exists, we just can't signal it
-    return alive
+    return jsonify({"error": message, **extra}), status
 
 
-def _watch_parent(parent_pid: int) -> None:
-    """Self-terminate when the Tauri shell goes away.
+def api_key_required(view):
+    """Authenticate via `Authorization: Bearer <key>` or `X-API-Key: <key>`."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not _API_KEY:
+            return _api_error("API disabled: FINANCE_API_KEY is not set", 503)
+        header = request.headers.get("Authorization", "")
+        supplied = (
+            header[7:].strip()
+            if header[:7].lower() == "bearer "
+            else request.headers.get("X-API-Key", "").strip()
+        )
+        # compare_digest keeps the check constant-time; a plain == leaks the
+        # key's prefix to anyone who can time the response.
+        if not supplied or not secrets.compare_digest(supplied, _API_KEY):
+            return _api_error("Unauthorized", 401)
+        return view(*args, **kwargs)
+    return wrapped
 
-    Tauri kills our sidecar's process on window close, but PyInstaller --onefile
-    spawns a bootloader that forks a child Python process; killing the bootloader
-    does not propagate to the Python child. This watchdog polls for the shell
-    and exits when it disappears — also catches force-quit from Task Manager.
+
+def _api_int(name, default, low, high):
+    """(value, None) or (None, error_response).
+
+    Rejects an out-of-range value rather than clamping it, and names the bounds:
+    silently returning 24 months for `months=500` would leave the caller quoting
+    a window it never asked for.
     """
-    import os
-    import time
-    alive = _make_parent_alive_probe(parent_pid)
-    while True:
-        if not alive():
-            os._exit(0)
-        time.sleep(2)
+    raw = (request.args.get(name) or "").strip()
+    if not raw:
+        return default, None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None, _api_error(f"{name} must be a whole number.", 400)
+    if not low <= value <= high:
+        return None, _api_error(f"{name} must be between {low} and {high}.", 400)
+    return value, None
+
+
+def _api_default_month(conn):
+    """This month if it holds any transactions, else the newest month that does.
+
+    Imports are manual, so defaulting blindly to today would return an empty
+    month for the first week or two of every month — and a caller reading that
+    would confidently report that nothing had been spent. Falling back to the
+    newest populated month keeps the answer about real data; data_freshness then
+    says how old that data is.
+    """
+    today = date.today().strftime("%Y-%m")
+    if conn.execute(
+        "SELECT 1 FROM transactions WHERE substr(date, 1, 7) = ? LIMIT 1", (today,)
+    ).fetchone():
+        return today
+    newest = conn.execute("SELECT MAX(substr(date, 1, 7)) FROM transactions").fetchone()[0]
+    return newest or today
+
+
+def _api_period(conn):
+    """(period, None) or (None, error_response) from month/range/salary_period."""
+    month = (request.args.get("month") or "").strip()
+    salary_period = (request.args.get("salary_period") or "").strip()
+    rng = (request.args.get("range") or "1m").strip()
+
+    if rng not in _API_RANGES:
+        return None, _api_error(
+            f"Unknown range '{rng}'.", 400, valid_range=list(_API_RANGES)
+        )
+    if month:
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+            return None, _api_error(
+                f"Invalid month '{month}' — expected JJJJ-MM, e.g. 2026-08.", 400
+            )
+    else:
+        month = _api_default_month(conn)
+
+    return _resolve_period(conn, month, salary_period, rng), None
+
+
+def _api_period_block(period):
+    return {
+        "label": period["label"],
+        "mode": period["mode"],
+        "month": period["month"],
+        "range": period["range"],
+        "start": period["start"],
+        "end_exclusive": period["end_exclusive"],
+    }
+
+
+def _api_topic_names(conn):
+    return [r["name"] for r in conn.execute("SELECT name FROM topics ORDER BY name")]
+
+
+def _api_generated_at():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+@app.get("/api/v1/ping")
+def api_v1_ping():
+    """Liveness, deliberately unauthenticated.
+
+    It exposes nothing personal, and a caller debugging a 401 needs to tell "the
+    app is down" apart from "my key is wrong" without already holding a valid
+    key. `has_data` rather than the newest transaction date on purpose: whether
+    the owner has imported anything is harmless, when they last touched their
+    finances is not. Freshness lives in the authenticated responses.
+    """
+    with get_connection() as conn:
+        has_data = conn.execute("SELECT 1 FROM transactions LIMIT 1").fetchone() is not None
+    return jsonify(
+        ok=True,
+        app="finance-sorter",
+        api_enabled=bool(_API_KEY),
+        today=date.today().isoformat(),
+        has_data=has_data,
+    )
+
+
+@app.get("/api/v1/overview")
+@api_key_required
+def api_v1_overview():
+    """Where the finances stand over a period: totals, savings rate, fixed costs,
+    spend per topic with categories nested, and movement against prior months.
+
+    Built on _build_ai_summary_payload, which is also what the in-app Gemini
+    digest renders from — so the page, this API and any assistant reading it
+    cannot drift into quoting different numbers for the same month. It is also
+    already the right privacy shape: it never emits raw transaction free-text,
+    only topic and category aggregates plus IBAN-scrubbed anomaly strings.
+    _build_diagnostics itself must never be served raw here, because it carries
+    largest_tx — a whole transaction row, merchant name included.
+    """
+    with get_connection() as conn:
+        period, err = _api_period(conn)
+        if err:
+            return err
+        payload = _build_ai_summary_payload(conn, period)
+
+    payload["generated_at"] = _api_generated_at()
+    payload["period"] = _api_period_block(period)
+    return jsonify(payload)
+
+
+@app.get("/api/v1/spending")
+@api_key_required
+def api_v1_spending():
+    """Spend per topic or per category, month by month.
+
+    Its own query rather than _compute_topic_history: that one is fixed at the
+    eight largest topics over twelve months for the digest's benefit, where this
+    needs a caller-chosen window, an optional topic filter, and categories as
+    well as topics.
+    """
+    by = (request.args.get("by") or "topic").strip().lower()
+    if by not in ("topic", "category"):
+        return _api_error(f"Unknown by '{by}'.", 400, valid_by=["topic", "category"])
+
+    months_back, err = _api_int("months", 6, 1, _API_MAX_MONTHS)
+    if err:
+        return err
+
+    topic_filter = (request.args.get("topic") or "").strip()
+
+    with get_connection() as conn:
+        if topic_filter:
+            names = _api_topic_names(conn)
+            match = next((n for n in names if n.lower() == topic_filter.lower()), None)
+            if match is None:
+                return _api_error(
+                    f"Unknown topic '{topic_filter}'.", 400, valid_topics=names
+                )
+            topic_filter = match
+
+        months = _months_back(_api_default_month(conn), months_back)
+        placeholders = ",".join("?" * len(months))
+        label_col = "tp.name" if by == "topic" else "COALESCE(c.name, 'Ongecategoriseerd')"
+        params = list(months)
+        topic_clause = ""
+        if topic_filter:
+            topic_clause = "AND tp.name = ?"
+            params.append(topic_filter)
+
+        rows = conn.execute(
+            f"""SELECT substr(t.date, 1, 7) AS m,
+                       {label_col} AS label,
+                       SUM(t.amount) AS spent
+                FROM transactions t
+                LEFT JOIN categories c ON c.id = t.category_id
+                LEFT JOIN topics tp ON tp.id = c.topic_id
+                WHERE substr(t.date, 1, 7) IN ({placeholders})
+                  AND t.direction = 'Debit'
+                  AND COALESCE(tp.exclude_from_totals, 0) = 0
+                  AND COALESCE(t.is_matched, 0) = 0
+                  {topic_clause}
+                GROUP BY m, label""",
+            params,
+        ).fetchall()
+        freshness = _data_freshness(conn)
+
+    month_idx = {m: i for i, m in enumerate(months)}
+    buckets = defaultdict(lambda: [0.0] * len(months))
+    for r in rows:
+        buckets[r["label"]][month_idx[r["m"]]] = round(float(r["spent"] or 0), 2)
+
+    series = [
+        {
+            "name": name,
+            "total": round(sum(values), 2),
+            "avg_per_month": round(sum(values) / len(months), 2),
+            "months": [{"month": m, "spent": values[i]} for i, m in enumerate(months)],
+        }
+        for name, values in buckets.items()
+    ]
+    series.sort(key=lambda s: -s["total"])
+
+    return jsonify(
+        generated_at=_api_generated_at(),
+        by=by,
+        topic=topic_filter or None,
+        start=months[0],
+        end=months[-1],
+        months=len(months),
+        data_freshness=freshness,
+        series=series,
+    )
+
+
+@app.get("/api/v1/subscriptions")
+@api_key_required
+def api_v1_subscriptions():
+    """Recurring charges, and what they add up to per month.
+
+    Reuses the bucketing the Sparen page uses, so each charge is counted once
+    and only once. cadence_days separates a monthly charge from a quarterly or
+    annual one, which has to happen before anything is called "monthly spend".
+    """
+    with get_connection() as conn:
+        buckets = _build_subscription_buckets(conn)
+        freshness = _data_freshness(conn)
+
+    subs = []
+    monthly_total = 0.0
+    for (scope, key, amount_tag), records in buckets.items():
+        summary = _summarize_subscription_bucket(records)
+        if not summary:
+            continue
+        latest = summary["latest"]
+        cadence = summary["cadence_days"]
+        amount = round(float(summary["median"]), 2)
+        # Normalise to a monthly figure, or a quarterly and an annual charge
+        # would inflate the headline by their full amounts.
+        monthly_total += amount * (30.44 / cadence) if cadence else amount
+        subs.append({
+            "label": _subscription_label(scope, key, amount_tag, latest),
+            "amount": amount,
+            "cadence_days": cadence,
+            "last_seen": latest["date"] if latest else None,
+            "charges": len(summary["records"]),
+            "price_change": summary["price_change"],
+        })
+
+    subs.sort(key=lambda s: -s["amount"])
+    return jsonify(
+        generated_at=_api_generated_at(),
+        count=len(subs),
+        monthly_total=round(monthly_total, 2),
+        data_freshness=freshness,
+        subscriptions=subs,
+    )
+
+
+@app.get("/api/v1/savings")
+@api_key_required
+def api_v1_savings():
+    """Money moving through the Sparen topic, by month.
+
+    NOTE the sign convention, which is deliberate and inverted relative to the
+    rest of the app: it is written from the savings account's point of view, so
+    a Debit on the current account is an `in` (money arriving in savings) and a
+    Credit is an `out`. The field names say so, and so does `convention` in the
+    response — do not "correct" them.
+
+    The page's per-month `tx` arrays are dropped: they carry raw names and
+    counterparties, which this API does not hand out outside /transactions.
+    """
+    months_back, err = _api_int("months", 12, 1, _API_MAX_MONTHS)
+    if err:
+        return err
+
+    with get_connection() as conn:
+        data = _build_savings_data(conn)
+        freshness = _data_freshness(conn)
+
+    monthly = [
+        {
+            "month": m["month"],
+            "label": m["label"],
+            "in": round(m["ins"], 2),
+            "out": round(m["outs"], 2),
+            "net": round(m["net"], 2),
+        }
+        for m in data["monthly"][:months_back]
+    ]
+
+    return jsonify(
+        generated_at=_api_generated_at(),
+        convention=(
+            "in = money moved into savings (a Debit on the current account); "
+            "out = money taken back out (a Credit)"
+        ),
+        months=len(monthly),
+        total_in=round(data["total_in"], 2),
+        total_out=round(data["total_out"], 2),
+        net_total=round(data["net_total"], 2),
+        avg_net_per_month=round(data["avg_net"], 2),
+        data_freshness=freshness,
+        monthly=monthly,
+    )
+
+
+@app.get("/api/v1/transactions")
+@api_key_required
+def api_v1_transactions():
+    """Look up individual transactions. Requires a filter.
+
+    The only route that returns raw merchant text, and it stays as narrow as it
+    can while still answering "what was that 42 euro": no notifications, no
+    counterparty, no account, no running balance, no IBAN. At least one of
+    q / topic / category is required — without a filter this would be a route
+    that dumps the whole history, which is precisely what it is not for.
+    """
+    q = (request.args.get("q") or "").strip()
+    topic = (request.args.get("topic") or "").strip()
+    category = (request.args.get("category") or "").strip()
+
+    if not (q or topic or category):
+        return _api_error(
+            "Give at least one of q, topic or category — this endpoint looks "
+            "transactions up, it does not list them all.",
+            400,
+            required_one_of=["q", "topic", "category"],
+        )
+
+    limit, err = _api_int("limit", _API_TX_LIMIT_DEFAULT, 1, _API_TX_LIMIT_MAX)
+    if err:
+        return err
+    days, err = _api_int("days", 0, 1, _API_MAX_DAYS)
+    if err:
+        return err
+
+    direction = (request.args.get("direction") or "").strip().lower()
+    if direction and direction not in ("debit", "credit"):
+        return _api_error(
+            f"Unknown direction '{direction}'.", 400,
+            valid_direction=["debit", "credit"],
+        )
+
+    where = ["COALESCE(t.is_matched, 0) = 0"]
+    params = []
+    if q:
+        where.append(r"t.name LIKE ? ESCAPE '\'")
+        params.append(f"%{_escape_like(q)}%")
+    if direction:
+        where.append("t.direction = ?")
+        params.append(direction.capitalize())
+
+    start = None
+    if days:
+        start = (date.today() - timedelta(days=days)).isoformat()
+        where.append("t.date >= ?")
+        params.append(start)
+
+    with get_connection() as conn:
+        if topic:
+            names = _api_topic_names(conn)
+            match = next((n for n in names if n.lower() == topic.lower()), None)
+            if match is None:
+                return _api_error(f"Unknown topic '{topic}'.", 400, valid_topics=names)
+            where.append("tp.name = ?")
+            params.append(match)
+        if category:
+            cats = [
+                r["name"] for r in conn.execute(
+                    "SELECT DISTINCT name FROM categories ORDER BY name"
+                )
+            ]
+            match = next((n for n in cats if n.lower() == category.lower()), None)
+            if match is None:
+                return _api_error(
+                    f"Unknown category '{category}'.", 400, valid_categories=cats
+                )
+            where.append("c.name = ?")
+            params.append(match)
+
+        # limit + 1 so `truncated` reports whether anything was cut off, without
+        # paying for a second COUNT query.
+        rows = conn.execute(
+            f"""SELECT t.date, t.name, t.amount, t.direction,
+                       tp.name AS topic, c.name AS category
+                FROM transactions t
+                LEFT JOIN categories c ON c.id = t.category_id
+                LEFT JOIN topics tp ON tp.id = c.topic_id
+                WHERE {' AND '.join(where)}
+                ORDER BY t.date DESC, t.id DESC
+                LIMIT ?""",
+            params + [limit + 1],
+        ).fetchall()
+        freshness = _data_freshness(conn)
+
+    return jsonify(
+        generated_at=_api_generated_at(),
+        count=min(len(rows), limit),
+        truncated=len(rows) > limit,
+        start=start,
+        data_freshness=freshness,
+        transactions=[
+            {
+                "date": r["date"],
+                "name": r["name"],
+                "amount": round(float(r["amount"] or 0), 2),
+                "direction": r["direction"],
+                "topic": r["topic"],
+                "category": r["category"],
+            }
+            for r in rows[:limit]
+        ],
+    )
+
+
+# ----- Bootstrap -------------------------------------------------------------
+
+# At module scope, not inside __main__: the schema must exist however the app is
+# started, and a restore re-runs this to migrate an uploaded database forward.
+init_db()
 
 
 if __name__ == "__main__":
-    init_db()
-    frozen = getattr(sys, "frozen", False)
+    # Debug and the reloader are opt-in, never inferred. They used to be on
+    # whenever the app wasn't a frozen build, which was harmless while this only
+    # ever ran on loopback but would put an interactive traceback console — a
+    # remote shell — on a network-reachable port under App Hub. The reloader also
+    # double-spawns the process, which breaks signal delivery to a supervised app.
+    # Set FINANCE_DEBUG=1 for local development.
+    debug = os.environ.get("FINANCE_DEBUG", "").strip().lower() in ("1", "true", "yes")
 
-    parent_pid = _parse_int_flag("--parent-pid")
-    if parent_pid:
-        import threading
-        threading.Thread(
-            target=_watch_parent, args=(parent_pid,), daemon=True
-        ).start()
-
-    # Frozen mode: no debug, no reloader (reloader spawns a second process and
-    # breaks PyInstaller + the Tauri sidecar lifecycle).
+    # PORT falls back to 5004 so run.bat keeps working on Windows, and the bind
+    # host defaults to loopback: App Hub fronts this over HTTPS via tailscale
+    # serve, so the raw port should not be exposed.
     app.run(
-        host="127.0.0.1",
-        port=_parse_port(),
-        debug=not frozen,
-        use_reloader=not frozen,
+        host=os.environ.get("APPHUB_BIND_HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "5004")),
+        debug=debug,
+        use_reloader=debug,
     )

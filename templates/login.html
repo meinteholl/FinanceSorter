@@ -29,6 +29,30 @@
     <p class="auth-switch">
       Nog geen account? <a href="{{ url_for('signup') }}">Maak er een aan</a>
     </p>
+
+    {# Only on a fresh install, alongside signup: the two ways of claiming this
+       app. Both disappear the moment one of them succeeds. #}
+    <details class="auth-restore">
+      <summary>Bestaande database uploaden</summary>
+      <div class="auth-restore-body">
+        <p class="auth-hint">
+          Heb je Finance Sorter al ergens anders gebruikt? Upload dan je
+          <code>finance.db</code> — je transacties, categorieën, regels én je
+          inloggegevens komen mee. Daarna log je in met je bestaande wachtwoord.
+        </p>
+        <form method="post" action="{{ url_for('restore') }}"
+              enctype="multipart/form-data" class="auth-form">
+          <label class="auth-field">
+            <span>Databasebestand</span>
+            <input type="file" name="database" accept=".db,.sqlite,.sqlite3"
+                   required>
+          </label>
+          <button type="submit" class="auth-submit auth-submit-secondary">
+            Database laden
+          </button>
+        </form>
+      </div>
+    </details>
     {% endif %}
   </div>
 </div>
