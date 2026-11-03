@@ -216,7 +216,9 @@
             {% if sug %}
               {% if sug.source == 'llm' %}
                 {# Tier 3: no history existed for this counterparty, so the local
-                   model guessed from the merchant name. Always confirm-first. #}
+                   model guessed from the transaction itself. Always confirm-first.
+                   sug.reason is blank when the model's wording quoted text this
+                   row does not contain — see llm_categorize.ground_reason. #}
                 <div class="sug-hint sug-hint-llm"
                      title="Voorgesteld door het lokale model ({{ sug.model }}) · zekerheid: {{ sug.confidence or 'onbekend' }}. Er is nog geen geschiedenis voor deze tegenpartij.">
                   <span class="sug-dot" style="background: {{ sug.category_color }};"></span>

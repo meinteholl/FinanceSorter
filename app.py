@@ -460,6 +460,69 @@ KNOWN_CHAINS = [
 ]
 
 
+# Dutch forms of address. These carry no identity of their own — every "Mw" is
+# a different woman — so they must never survive into a merchant key, and a name
+# that opens with one belongs to a private person rather than a business.
+NAME_TITLES = frozenset({
+    "mw", "mevr", "mevrouw", "dhr", "hr", "heer", "fam", "familie",
+    "mr", "mrs", "ms", "drs", "ir", "prof",
+})
+
+# ING codes that can only be a business on the other end: a card terminal, a
+# cash machine and an iDEAL payment all happen at a merchant. Checked instead of
+# transaction_type because ING exports that field in Dutch or English depending
+# on the file, while the code is the same either way.
+MERCHANT_ONLY_CODES = frozenset({"BA", "GM", "ID", "IW"})
+
+# An initials run followed by a surname: "AB Voorbeeld", "P.J. Bosman". Capped at
+# three so an all-caps brand with a place after it ("IKEA Groningen") is not read
+# as a person.
+_PERSON_INITIALS_RE = re.compile(r"^\s*(?:[A-Z]\.?\s*){1,3}[A-Z][a-z]")
+
+
+def _drop_name_prefix(tokens, all_caps):
+    """Strip a leading honorific, and the initials that follow it.
+
+    "Mw AB Voorbeeld" keyed on its first two tokens as `mw ab` — the surname, the
+    only part that identifies anyone, was thrown away, and every "Mw AB ..." in
+    the file collapsed into one bucket. Keying on `voorbeeld` instead keeps
+    distinct people distinct.
+
+    Initials are only stripped behind an honorific, and only when the name is not
+    wholly uppercase: in "DHR JAN DE BOER" a short all-caps token is as likely to
+    be a first name as an initial, and dropping it would merge Jan with Piet.
+    """
+    out = list(tokens)
+    if not out or out[0].lower() not in NAME_TITLES:
+        return out
+    out.pop(0)
+    if not all_caps:
+        while out and out[0].isupper() and len(out[0]) <= 3:
+            out.pop(0)
+    return out
+
+
+def _looks_like_person_name(name: str) -> bool:
+    """Is this a private individual rather than a shop or a company?
+
+    Matters because a person is not a merchant. Albert Heijn sells groceries
+    every time, so one verdict covers every future row; a person transfers money
+    for lunch one month and a birthday present the next, and only the
+    description says which. Grouping their rows and judging one of them puts the
+    wrong category — and a reason quoting the wrong row's text — on all of them.
+
+    Over-matching is the cheap direction: a company read as a person only costs
+    one extra model call per row, where a person read as a company is the bug.
+    """
+    name = (name or "").strip()
+    if not name:
+        return False
+    first = re.split(r"[\s.]+", name, maxsplit=1)[0].lower()
+    if first in NAME_TITLES:
+        return True
+    return bool(_PERSON_INITIALS_RE.match(name))
+
+
 def _clean_merchant_text(s: str) -> str:
     """Strip card prefix and long digit runs (store numbers, terminal IDs)."""
     if not s:
@@ -687,15 +750,18 @@ def _merchant_key(name: str) -> str:
     """Conservative merchant identifier used to group similar transactions.
 
     1. Strip card prefix and long digit runs (store numbers, terminal IDs).
-    2. If the cleaned token stream starts with a known chain variant, collapse
+    2. Drop a leading Dutch honorific and the initials behind it, so a person is
+       keyed on their surname rather than on "mw ab".
+    3. If the cleaned token stream starts with a known chain variant, collapse
        to the canonical chain name. Lets 'Hema Den Haag CS' and 'AH to go 1234'
        group with their siblings regardless of city or store-number.
-    3. Otherwise fall back to the first two alphabetic tokens, lowercased.
+    4. Otherwise fall back to the first two alphabetic tokens, lowercased.
     """
     if not name:
         return ""
     cleaned = _clean_merchant_text(name)
     tokens = re.findall(r"[A-Za-z][A-Za-z'&]+", cleaned)
+    tokens = _drop_name_prefix(tokens, cleaned.isupper())
     if not tokens:
         return ""
     lowered = " ".join(t.lower() for t in tokens)
@@ -1040,8 +1106,22 @@ def _llm_suggestion_key(row):
     made for 'albert heijn' covers every future Albert Heijn row. Falls back to
     the counterparty, then to the row itself for one-offs that generalize to
     nothing.
+
+    Private individuals are deliberately excluded from that generalization. The
+    sweep classifies one representative row per key and replays the answer onto
+    every row sharing it, which is sound for a shop — Albert Heijn sells
+    groceries every time — and wrong for a person, whose category lives in the
+    per-row description rather than in their name. A single "Mw AB Voorbeeld"
+    transfer labelled from its 'Cadeautje voor Jordi' description used to put
+    Cadeautjes, and that sentence about a present, on her 'Lunch Deck' row too.
+    Keying those rows individually costs one model call each and judges each
+    description on its own.
     """
-    mk = _merchant_key(_row_get(row, "name") or "")
+    name = _row_get(row, "name") or ""
+    code = (_row_get(row, "code") or "").strip().upper()
+    if code not in MERCHANT_ONLY_CODES and _looks_like_person_name(name):
+        return ("tx", str(_row_get(row, "id")))
+    mk = _merchant_key(name)
     if mk:
         return ("merchant", mk)
     cp = (_row_get(row, "counterparty") or "").strip()
@@ -1077,6 +1157,23 @@ def _llm_rejected_pairs(conn):
     return {(r["signal_key"], r["suggested_category_id"]) for r in rows}
 
 
+def _reason_vocabulary(conn):
+    """Category and topic names, which a reason may quote without them being in
+    the transaction text ("past bij 'Uiteten'").
+
+    Read once per page by the caller, not per row — sqlite3.Connection has no
+    __dict__, so there is nowhere to memoize this onto.
+    """
+    try:
+        return {
+            r[0] for r in conn.execute(
+                "SELECT name FROM categories UNION SELECT name FROM topics"
+            ).fetchall() if r[0]
+        }
+    except sqlite3.OperationalError:
+        return set()
+
+
 def _load_llm_suggestions(conn, rows):
     """Stored local-model guesses for `rows`, keyed by tx id.
 
@@ -1102,6 +1199,7 @@ def _load_llm_suggestions(conn, rows):
 
     by_key = {(r["scope"], r["key"]): r for r in cached}
     rejected = _llm_rejected_pairs(conn)
+    vocabulary = _reason_vocabulary(conn)
 
     out = {}
     for tx in rows:
@@ -1112,6 +1210,25 @@ def _load_llm_suggestions(conn, rows):
         signal_key = _llm_signal_key(scope, key)
         if (signal_key, hit["category_id"]) in rejected:
             continue
+
+        # A merchant- or counterparty-scoped verdict was reached on one
+        # representative row and is replayed onto every row sharing the key, so
+        # it is re-checked here against the row it is about to appear under. If
+        # the model's stated evidence was a quote from the description and this
+        # row's description does not contain it, the evidence is about some
+        # other transaction and nothing here supports the category — drop the
+        # whole suggestion rather than print a category backed by a sentence
+        # that is false of the row it sits under. Leaving the row unsuggested is
+        # the honest outcome; the next sweep can still key it individually.
+        #
+        # A 'tx' scope was judged on this very row, so an ungrounded quote there
+        # is the model inventing one. The category may still be right, so only
+        # the reason goes.
+        stored_reason = (hit["reason"] or "").strip()
+        reason = llm_categorize.ground_reason(stored_reason, tx, vocabulary)
+        if stored_reason and not reason and scope != "tx":
+            continue
+
         out[tx["id"]] = {
             "category_id": hit["category_id"],
             "category_name": hit["category_name"],
@@ -1123,7 +1240,7 @@ def _load_llm_suggestions(conn, rows):
             "signal_source": "llm",
             "signal_key": signal_key,
             "confidence": hit["confidence"],
-            "reason": hit["reason"],
+            "reason": reason,
             "model": hit["model"],
         }
     return out

@@ -24,6 +24,7 @@ install step App Hub runs from it — are unaffected.
 
 import functools
 import json
+import re
 import subprocess
 import sys
 import urllib.error
@@ -435,6 +436,8 @@ def build_context(conn, examples_per_category=EXAMPLES_PER_CATEGORY,
     return {
         "system": system,
         "valid_ids": set(valid_ids),
+        # Names a reason may quote without them being in the transaction text.
+        "vocabulary": {c["name"] for c in cats} | {c["topic_name"] for c in cats},
         "schema": _response_schema(valid_ids),
         "category_count": len(cats),
         "example_count": len(examples),
@@ -490,6 +493,79 @@ def _response_schema(valid_ids):
         },
         "required": ["category_id", "confidence", "reason"],
     }
+
+
+# ---------- reason grounding ----------
+
+# Quoted spans inside a model's reason, in the quote styles one actually emits.
+#
+# The straight-apostrophe form is fenced with lookarounds so a Dutch genitive
+# ("Geeta's is een restaurant") is not mistaken for an opening quote and paired
+# with the next apostrophe further down the sentence.
+_QUOTED_SPANS = (
+    re.compile(r"(?<![A-Za-z])'([^']{2,60})'(?![A-Za-z])"),
+    re.compile(r'"([^"]{2,60})"'),
+    re.compile("‘([^’]{2,60})’"),
+    re.compile("“([^”]{2,60})”"),
+)
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(s):
+    return _WS_RE.sub(" ", str(s if s is not None else "")).strip().lower()
+
+
+def tx_haystack(tx):
+    """Every field the model was shown for this transaction, as one lowercase string."""
+    def get(key):
+        try:
+            value = tx[key]
+        except (KeyError, IndexError, TypeError):
+            return ""
+        return "" if value is None else str(value)
+
+    return _norm(" ".join(
+        get(k) for k in
+        ("name", "counterparty", "code", "transaction_type", "notifications")
+    ))
+
+
+def ground_reason(reason, tx, vocabulary=()):
+    """Return `reason`, or "" when it quotes text this transaction does not contain.
+
+    A reason that cites the description is a factual claim about *this* row, and
+    the UI prints it verbatim under the suggestion. Two things make such a claim
+    go wrong, and this catches both:
+
+    * The model invents the quote outright.
+    * The reason is true, but about a different transaction. Suggestions are
+      cached per merchant key and replayed onto every row that shares it, so a
+      reason written for 'Cadeautje voor Jordi' used to appear under a row whose
+      description reads 'Lunch Deck'. That is the case this was written for.
+
+    Unquoted claims ("Albert Heijn is een bekende boodschappenketen") are world
+    knowledge, not a citation, and are left alone — they are the model's opinion
+    and the user judges them by accepting or rejecting. Only a quote, which
+    asserts the text is *there*, has to be checked.
+
+    `vocabulary` is the category and topic names, which a reason may legitimately
+    quote ("past bij 'Uiteten'") without them appearing in the transaction.
+
+    Dropping the reason rather than the suggestion is deliberate: the category
+    may still be right, and no explanation beats a false one.
+    """
+    reason = str(reason or "").strip()
+    if not reason:
+        return ""
+    haystack = tx_haystack(tx)
+    allowed = {_norm(v) for v in vocabulary if v}
+    for pattern in _QUOTED_SPANS:
+        for match in pattern.finditer(reason):
+            quoted = _norm(match.group(1))
+            if quoted and quoted not in haystack and quoted not in allowed:
+                return ""
+    return reason
 
 
 # ---------- classification ----------
@@ -569,4 +645,9 @@ def classify(context, tx, model, url=DEFAULT_URL, timeout=CLASSIFY_TIMEOUT):
         raise OllamaError(f"{e.__class__.__name__}: {e}") from e
 
     content = ((body or {}).get("message") or {}).get("content")
-    return parse_response(content, context["valid_ids"])
+    result = parse_response(content, context["valid_ids"])
+    if result is not None:
+        result["reason"] = ground_reason(
+            result["reason"], tx, context.get("vocabulary", ())
+        )
+    return result
