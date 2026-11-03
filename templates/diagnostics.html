@@ -121,24 +121,30 @@
       </div>
     </div>
     <div class="dash-kpi"
-         {% if data.savings_rate_salary is not none and data.savings_rate_all is not none %}
+         {% if data.savings_rate_thin %}
+           title="Er kwam deze periode {{ data.income | eur }} binnen tegenover {{ data.expenses | eur }} aan uitgaven — te weinig inkomen om een spaarquote op te baseren."
+         {% elif data.savings_rate_salary is not none and data.savings_rate_all is not none %}
            title="Alleen salaris als basis. Op basis van alle bijschrijvingen (incl. terugbetalingen, giften): {{ '{:.0f}%'.format(data.savings_rate_all * 100) }}"
          {% elif data.savings_rate_salary is none and data.savings_rate_all is not none %}
            title="Op basis van alle bijschrijvingen — markeer je salaris met de categorie 'Salaris' voor een eerlijker spaarquote."
          {% endif %}>
       <div class="dash-kpi-label">
         Spaarquote
-        {% if data.savings_rate_salary is not none %}
-          <span class="muted">· van salaris</span>
-        {% elif data.savings_rate_all is not none %}
-          <span class="muted">· van alle bijschrijvingen</span>
+        {% if data.savings_rate is not none %}
+          {% if data.savings_rate_basis == 'salary' %}
+            <span class="muted">· van salaris</span>
+          {% elif data.savings_rate_basis == 'all' %}
+            <span class="muted">· van alle bijschrijvingen</span>
+          {% endif %}
         {% endif %}
       </div>
       <div class="dash-kpi-value {% if data.savings_rate is none %}muted{% elif data.savings_rate >= 0 %}pos{% else %}neg{% endif %}">
         {% if data.savings_rate is none %}—{% else %}{{ '{:.0f}%'.format(data.savings_rate * 100) }}{% endif %}
       </div>
       <div class="dash-kpi-meta">
-        {% if data.is_current_month and data.period_mode == 'month' %}
+        {% if data.savings_rate_thin %}
+          Te weinig inkomsten deze periode
+        {% elif data.is_current_month and data.period_mode == 'month' %}
           Dag {{ data.days_elapsed }} van {{ data.days_in_month }}
         {% elif data.window_days %}
           over {{ data.window_days }} dagen

@@ -4743,6 +4743,26 @@ def _build_topic_trends(conn, period):
     }
 
 
+# A savings quote answers "how much of what came in did you keep", which only
+# holds while the denominator is an income. July 2026 took in €42,20 of
+# incidental credits against €1.260,91 of spending, and the tile read -2888%:
+# arithmetically right, and about the €42 rather than about the month. Below a
+# third of the period's spending there is nothing to divide by, so the quote is
+# withheld and the Netto tile carries the month on its own.
+SAVINGS_RATE_MIN_BASE_RATIO = 1 / 3
+
+
+def _savings_rate(net, base, expenses):
+    """Savings rate of `net` against an income `base`, or None when that base
+    is too thin against `expenses` to carry a percentage."""
+    base = float(base or 0)
+    if base <= 0:
+        return None
+    if float(expenses or 0) > 0 and base < float(expenses) * SAVINGS_RATE_MIN_BASE_RATIO:
+        return None
+    return float(net) / base
+
+
 def _build_diagnostics(conn, period, balance_account=None):
     today = date.today()
     month = period.get("month") or period["start"][:7]
@@ -4781,12 +4801,17 @@ def _build_diagnostics(conn, period, balance_account=None):
         if r["direction"] == "Credit" and not r["excluded"]
         and r["is_salary"]
     )
-    savings_rate_salary = (
-        (income - expenses) / salary_income if salary_income > 0 else None
-    )
-    savings_rate_all = (net / income) if income > 0 else None
+    savings_rate_salary = _savings_rate(net, salary_income, expenses)
+    savings_rate_all = _savings_rate(net, income, expenses)
     # Public 'savings_rate' = salary-based when Salary is tagged, else all-credits.
-    savings_rate = savings_rate_salary if savings_rate_salary is not None else savings_rate_all
+    # The basis follows what is tagged, not which of the two survived the
+    # thin-base guard: falling back to the wider denominator the moment the
+    # salary one is withheld would flatter exactly the months it protects.
+    savings_rate_basis = "salary" if salary_income > 0 else ("all" if income > 0 else None)
+    savings_rate = savings_rate_salary if savings_rate_basis == "salary" else savings_rate_all
+    # Withheld for a thin base rather than no income at all — the tile explains
+    # itself instead of leaving a bare dash.
+    savings_rate_thin = savings_rate is None and savings_rate_basis is not None
 
     end_y, end_m = int(month[:4]), int(month[5:7])
     days_in_month_n = monthrange(end_y, end_m)[1]
@@ -5006,6 +5031,8 @@ def _build_diagnostics(conn, period, balance_account=None):
         "savings_rate": savings_rate,
         "savings_rate_salary": savings_rate_salary,
         "savings_rate_all": savings_rate_all,
+        "savings_rate_basis": savings_rate_basis,
+        "savings_rate_thin": savings_rate_thin,
         "salary_income": salary_income,
         "daily_burn": daily_burn,
         "days_elapsed": days_elapsed,
@@ -5124,12 +5151,7 @@ def _compute_savings_rate_history(conn, period, months_back=6):
         expenses = flows[m]["expenses"]
         net = income - expenses
         salary = salary_by_month.get(m, 0.0)
-        if salary > 0:
-            rate = net / salary
-        elif income > 0:
-            rate = net / income
-        else:
-            rate = None
+        rate = _savings_rate(net, salary if salary > 0 else income, expenses)
         out.append({
             "month": m,
             "savings_rate": (round(rate, 3) if rate is not None else None),
@@ -5503,6 +5525,9 @@ AI_FORECAST_PROMPT = (
     "- Geen voorschrijvende formuleringen — geen \"je moet\", geen aanbevelingen.\n"
     "- Als `savings_rate_history` minder dan 3 voorgaande maanden met data "
     "bevat, erken dan dat de betrouwbaarheid beperkt is.\n"
+    "- Een `savings_rate` van null betekent dat er te weinig inkomsten "
+    "binnenkwamen om een spaarquote op te baseren; zeg dat zo en reken "
+    "er zelf geen uit.\n"
     "- Verwijs nooit naar winkels of tegenpartijen; spreek alleen in termen "
     "van onderwerpen/categorieën.\n"
     "- Alleen prozaparagrafen — geen opsommingen, geen koppen.\n\n"
@@ -5545,6 +5570,9 @@ AI_ADVICE_PROMPT = (
     "- Verwijs nooit naar winkels of tegenpartijen; spreek alleen in termen "
     "van onderwerpen/categorieën.\n"
     "- Als `savings_rate_history` minder dan 3 maanden data bevat, zeg dat dan.\n"
+    "- Een `savings_rate` van null betekent dat er te weinig inkomsten "
+    "binnenkwamen om een spaarquote op te baseren; zeg dat zo en reken "
+    "er zelf geen uit.\n"
     "- Alleen prozaparagrafen — geen opsommingen, geen koppen.\n\n"
     "Periodedata (JSON):\n"
 )
