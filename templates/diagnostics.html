@@ -1293,6 +1293,67 @@
     el.textContent = eur(total);
   }
 
+  // Chart.js paints its tooltip onto the canvas, and .pie-center — the total
+  // and the drill-back button — is an HTML overlay sitting on top of it. Any
+  // tooltip landing in the doughnut hole was therefore drawn underneath the
+  // total and unreadable. Rendering it as a DOM sibling of the canvas puts it
+  // in the same stacking context as the overlay, where z-index settles it.
+  function renderPieTooltip(context) {
+    const host = context.chart.canvas.parentElement;
+    if (!host) return;
+    let tip = host.querySelector('.pie-tip');
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.className = 'pie-tip';
+      host.appendChild(tip);
+    }
+
+    const model = context.tooltip;
+    if (!model.opacity) {
+      tip.style.opacity = '0';
+      return;
+    }
+
+    const swatch = (model.labelColors || [])[0] || {};
+    tip.textContent = '';
+    for (const title of model.title || []) {
+      const el = document.createElement('div');
+      el.className = 'pie-tip-title';
+      el.textContent = title;
+      tip.appendChild(el);
+    }
+    for (const body of model.body || []) {
+      for (const line of body.lines || []) {
+        const row = document.createElement('div');
+        row.className = 'pie-tip-row';
+        const dot = document.createElement('span');
+        dot.className = 'pie-tip-swatch';
+        dot.style.background = swatch.backgroundColor || 'transparent';
+        const text = document.createElement('span');
+        text.textContent = line;
+        row.append(dot, text);
+        tip.appendChild(row);
+      }
+    }
+
+    // Sit beside the hovered slice rather than over the hole, caret facing it,
+    // and stay inside the panel so a slice near an edge isn't clipped.
+    tip.style.opacity = '1';
+    const gap = 8;
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const hostW = host.clientWidth;
+    const hostH = host.clientHeight;
+    const side = model.caretX > hostW / 2 ? 'left' : 'right';
+    tip.dataset.side = side;
+    const wanted = side === 'left' ? model.caretX - gap - width : model.caretX + gap;
+    const left = Math.max(0, Math.min(wanted, hostW - width));
+    const top = Math.max(0, Math.min(model.caretY - height / 2, hostH - height));
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+    tip.style.setProperty('--caret-top', (model.caretY - top) + 'px');
+  }
+
   const pieCtx = document.getElementById('pieChart');
   let pieChart = null;
   if (pieCtx && pie.length) {
@@ -1315,6 +1376,8 @@
         plugins: {
           legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 }, padding: 8 } },
           tooltip: {
+            enabled: false,          // drawn as DOM instead — see renderPieTooltip
+            external: renderPieTooltip,
             callbacks: {
               label: (ctx) => {
                 const total = ctx.dataset.data.reduce((a, b) => a + b, 0);

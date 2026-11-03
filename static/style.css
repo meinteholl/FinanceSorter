@@ -3015,6 +3015,51 @@ code {
 }
 .pie-back:hover { background: var(--bg-hover); }
 
+/* Chart.js draws its tooltip inside the canvas, which .pie-center covers, so
+   the doughnut's tooltip is rendered as a DOM sibling instead (see
+   renderPieTooltip in diagnostics.html) and layered above the hole. */
+.pie-tip {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  background: rgba(0, 0, 0, 0.82);
+  color: #fff;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.35;
+  /* Shrink-wraps a short label; wraps rather than overflowing the panel when a
+     category name is long or the viewport is narrow. */
+  max-width: min(240px, calc(100% - 16px));
+}
+.pie-tip-title { font-weight: 700; margin-bottom: 4px; }
+.pie-tip-row { display: flex; align-items: center; gap: 6px; }
+.pie-tip-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: none;
+}
+/* Caret on the edge facing the slice being hovered. */
+.pie-tip::after {
+  content: '';
+  position: absolute;
+  top: var(--caret-top, 50%);
+  transform: translateY(-50%);
+  border: 6px solid transparent;
+}
+.pie-tip[data-side='left']::after {
+  left: 100%;
+  border-left-color: rgba(0, 0, 0, 0.82);
+}
+.pie-tip[data-side='right']::after {
+  right: 100%;
+  border-right-color: rgba(0, 0, 0, 0.82);
+}
+
 /* Categories page — topic groups + auto-color toggle */
 .topic-group {
   margin: 18px 0;
