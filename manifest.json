@@ -1,6 +1,6 @@
 {
   "name": "finance-sorter",
   "description": "Bankafschriften importeren, categoriseren en doorlichten.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "icon": "icon.png"
 }
