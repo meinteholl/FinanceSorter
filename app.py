@@ -5068,6 +5068,18 @@ def _compute_topic_history(conn, period, months_back=12):
     return {"months": months, "series": series}
 
 
+def _savings_history_window(period):
+    """How many months of savings-rate history to hand the advice model.
+
+    A year or quarter view anchors on its last month, so a fixed six-month
+    window can sit almost entirely past the imported data — a 2026 advice
+    anchored on December looked at Jul–Dec, found two months of data, and
+    correctly reported "less than three months of history" for a year that
+    had eight. Span the selected period instead, with six months as the
+    floor so a single-month view still carries a trend."""
+    return max(6, period.get("range_size") or 1)
+
+
 def _compute_savings_rate_history(conn, period, months_back=6):
     """Monthly savings rate over the last N months ending at the period's
     anchor month. Uses salary-anchored savings rate when a primary-salary
@@ -5340,7 +5352,8 @@ def _build_ai_summary_payload(conn, period, goal=None):
         "uncategorized_pct": round(diag["uncat_pct"], 1),
         "lowest_balance": diag["balance_trajectory"].get("lowest"),
         "topic_history_12mo": _compute_topic_history(conn, period, 12),
-        "savings_rate_history": _compute_savings_rate_history(conn, period, 6),
+        "savings_rate_history": _compute_savings_rate_history(
+            conn, period, _savings_history_window(period)),
         "salary_cadence": _compute_salary_cadence(conn),
         "recurring_load": _compute_recurring_load(conn, period),
         "day_of_period": _compute_day_of_period_distribution(conn, period),
