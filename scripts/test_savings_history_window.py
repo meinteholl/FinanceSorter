@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app  # noqa: E402
+import db  # noqa: E402
 
 FAILURES = []
 
@@ -33,26 +34,24 @@ def check(label, got, want):
 
 
 def conn_with_months(months):
-    """A connection holding one salary credit and one spend per listed month,
-    which is the least that makes a month count as having a savings rate."""
+    """A connection on the real schema holding one salary credit and one spend
+    per listed month, which is the least that makes a month count as having a
+    savings rate."""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
+    conn.executescript(db.SCHEMA)
     conn.executescript(
-        """CREATE TABLE topics (id INTEGER PRIMARY KEY, name TEXT,
-                                exclude_from_totals INTEGER DEFAULT 0);
-           CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT,
-                                    topic_id INTEGER, is_primary_salary INTEGER DEFAULT 0);
-           CREATE TABLE transactions (id INTEGER PRIMARY KEY, date TEXT,
-                                      direction TEXT, amount REAL,
-                                      category_id INTEGER, is_matched INTEGER DEFAULT 0);
-           INSERT INTO topics (id, name) VALUES (1, 'Salary'), (2, 'Food');
+        """INSERT INTO topics (id, name, color) VALUES (1, 'Salary', '#10b981'),
+                                                      (2, 'Food', '#f59e0b');
            INSERT INTO categories (id, name, topic_id, is_primary_salary)
                 VALUES (1, 'Salaris', 1, 1), (2, 'Boodschappen', 2, 0);"""
     )
     for m in months:
         conn.executemany(
-            "INSERT INTO transactions (date, direction, amount, category_id) VALUES (?,?,?,?)",
-            [(f"{m}-01", "Credit", 2500.0, 1), (f"{m}-05", "Debit", 1800.0, 2)],
+            "INSERT INTO transactions (date, name, direction, amount, category_id)"
+            " VALUES (?,?,?,?,?)",
+            [(f"{m}-01", "Salaris", "Credit", 2500.0, 1),
+             (f"{m}-05", "Jumbo", "Debit", 1800.0, 2)],
         )
     return conn
 

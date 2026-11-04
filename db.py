@@ -203,6 +203,59 @@ CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_id
 CREATE INDEX IF NOT EXISTS idx_categories_topic ON categories(topic_id);
 CREATE INDEX IF NOT EXISTS idx_corrections_signal
   ON corrections(signal_source, signal_key, suggested_category_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_match_parent
+  ON transactions(match_parent_id);
+
+-- Every total reads transactions through this view instead of the table.
+--
+-- A match group is a parent row plus the children dropped on it, and it nets
+-- out by signed sum: a EUR 2.905,43 salary with EUR 132,42 of commuting fares
+-- under it is EUR 2.773,01 of income. The totals used to filter on
+-- `is_matched = 0`, which drops every row in the group, parent included. That
+-- is right only while a group cancels exactly -- the spend-plus-refund case
+-- the matcher was written for -- and silently deletes the remainder in every
+-- other shape.
+--
+-- So: children are gone from the view, a parent carries its group's net as
+-- `amount` with the sign of that net as `direction` (the same figure the
+-- transactions list already draws on the anchor row), and the gross figures
+-- stay available under `gross_amount` / `gross_direction`. A row that was
+-- never matched passes through untouched, so a query reading the view sees
+-- what it always saw for everything outside a group.
+--
+-- A group's category is the parent's. Hanging a fare under a salary therefore
+-- moves it out of Transport and into the salary's topic as a smaller credit,
+-- which is what anchoring it there claims: the employer paid for the trip.
+DROP VIEW IF EXISTS tx_effective;
+CREATE VIEW tx_effective AS
+WITH group_net AS (
+  SELECT match_parent_id AS parent_id,
+         SUM(CASE WHEN direction = 'Credit' THEN amount ELSE -amount END) AS children_signed
+    FROM transactions
+   WHERE match_parent_id IS NOT NULL
+   GROUP BY match_parent_id
+),
+netted AS (
+  SELECT t.*,
+         (CASE WHEN t.direction = 'Credit' THEN t.amount ELSE -t.amount END)
+           + COALESCE(g.children_signed, 0) AS signed_net
+    FROM transactions t
+    LEFT JOIN group_net g ON g.parent_id = t.id
+   WHERE t.match_parent_id IS NULL
+)
+SELECT id, date, name, account, counterparty, code, transaction_type,
+       notifications, resulting_balance, tag, category_id,
+       categorization_source, suggestion_signal_source, suggestion_signal_key,
+       source_file, imported_at, match_parent_id, is_matched,
+       ABS(signed_net) AS amount,
+       CASE WHEN signed_net > 0 THEN 'Credit'
+            WHEN signed_net < 0 THEN 'Debit'
+            -- A group that cancels exactly keeps the anchor's own sign, so it
+            -- still reads as "spend, fully refunded" rather than as nothing.
+            ELSE direction END AS direction,
+       amount AS gross_amount,
+       direction AS gross_direction
+  FROM netted;
 """
 
 

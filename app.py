@@ -2168,9 +2168,11 @@ def transactions():
     # Flow filter — limits to real income, real expenses, or transfer-only rows.
     # Real income/expenses respect the "Exclude from totals" flag on the topic.
     if flow == "income":
-        where.append("t.direction = 'Credit' AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0")
+        where.append("COALESCE(tp.exclude_from_totals, 0) = 0 AND t.id IN "
+                     "(SELECT id FROM tx_effective WHERE direction = 'Credit')")
     elif flow == "expenses":
-        where.append("t.direction = 'Debit' AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0")
+        where.append("COALESCE(tp.exclude_from_totals, 0) = 0 AND t.id IN "
+                     "(SELECT id FROM tx_effective WHERE direction = 'Debit')")
     elif flow == "excluded":
         where.append("COALESCE(tp.exclude_from_totals, 0) = 1")
     elif direction == "credit":
@@ -3341,12 +3343,12 @@ def api_rules_preview():
 @app.route("/api/summary")
 def api_summary():
     month = request.args.get("month") or ""
-    where_clauses = ["COALESCE(t.is_matched, 0) = 0"]
+    where_clauses = []
     params = []
     if month:
         where_clauses.append("substr(t.date, 1, 7) = ?")
         params.append(month)
-    where = "WHERE " + " AND ".join(where_clauses)
+    where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     with get_connection() as conn:
         rows = conn.execute(
             f"""SELECT COALESCE(c.name, 'Ongecategoriseerd') AS category,
@@ -3355,7 +3357,7 @@ def api_summary():
                        SUM(CASE WHEN t.direction = 'Debit' THEN t.amount ELSE 0 END) AS spent,
                        SUM(CASE WHEN t.direction = 'Credit' THEN t.amount ELSE 0 END) AS received,
                        COUNT(*) AS count
-                FROM transactions t
+                FROM tx_effective t
                 LEFT JOIN categories c ON c.id = t.category_id
                 LEFT JOIN topics tp ON tp.id = c.topic_id
                 {where}
@@ -3864,12 +3866,12 @@ def _build_top_merchants(conn, period, limit=10):
     rows = conn.execute(
         f"""SELECT t.name, t.amount, c.name AS category_name,
                    COALESCE(c.color, tp.color) AS category_color
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
               AND t.direction = 'Debit'
-              AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0""",
+              AND COALESCE(tp.exclude_from_totals, 0) = 0""",
         params,
     ).fetchall()
 
@@ -4062,12 +4064,12 @@ def _build_calendar_heatmap(conn, end_date, start_d=None, end_d=None):
         scope = "rolling"
     rows = conn.execute(
         """SELECT t.date, SUM(t.amount) AS total
-           FROM transactions t
+           FROM tx_effective t
            LEFT JOIN categories c ON c.id = t.category_id
            LEFT JOIN topics tp ON tp.id = c.topic_id
            WHERE t.date >= ? AND t.date <= ?
              AND t.direction = 'Debit'
-             AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+             AND COALESCE(tp.exclude_from_totals, 0) = 0
            GROUP BY t.date""",
         (start.isoformat(), end_inclusive.isoformat()),
     ).fetchall()
@@ -4105,12 +4107,12 @@ def _build_dow_breakdown(conn, end_date, start_d=None, end_d=None):
         scope = "rolling"
     rows = conn.execute(
         """SELECT t.date, SUM(t.amount) AS total
-           FROM transactions t
+           FROM tx_effective t
            LEFT JOIN categories c ON c.id = t.category_id
            LEFT JOIN topics tp ON tp.id = c.topic_id
            WHERE t.date >= ? AND t.date <= ?
              AND t.direction = 'Debit'
-             AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+             AND COALESCE(tp.exclude_from_totals, 0) = 0
            GROUP BY t.date""",
         (start.isoformat(), end_inclusive.isoformat()),
     ).fetchall()
@@ -4157,24 +4159,24 @@ def _build_yoy(conn, period):
         """SELECT COALESCE(c.name, 'Ongecategoriseerd') AS name,
                   COALESCE(c.color, tp.color, '#94a3b8') AS color,
                   SUM(t.amount) AS spent
-           FROM transactions t
+           FROM tx_effective t
            LEFT JOIN categories c ON c.id = t.category_id
            LEFT JOIN topics tp ON tp.id = c.topic_id
            WHERE substr(t.date, 1, 7) = ?
              AND t.direction = 'Debit'
-             AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+             AND COALESCE(tp.exclude_from_totals, 0) = 0
            GROUP BY c.id""",
         (cur_month,),
     ).fetchall()
     prior_rows = conn.execute(
         """SELECT COALESCE(c.name, 'Ongecategoriseerd') AS name,
                   SUM(t.amount) AS spent
-           FROM transactions t
+           FROM tx_effective t
            LEFT JOIN categories c ON c.id = t.category_id
            LEFT JOIN topics tp ON tp.id = c.topic_id
            WHERE substr(t.date, 1, 7) = ?
              AND t.direction = 'Debit'
-             AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+             AND COALESCE(tp.exclude_from_totals, 0) = 0
            GROUP BY c.id""",
         (last_year,),
     ).fetchall()
@@ -4345,12 +4347,12 @@ def _build_fixed_vs_variable(conn, period):
               COALESCE(SUM(CASE WHEN COALESCE(tp.is_fixed, 0) = 1
                                 THEN t.amount ELSE 0 END), 0) AS fixed,
               COALESCE(SUM(t.amount), 0) AS total
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
               AND t.direction = 'Debit'
-              AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0""",
+              AND COALESCE(tp.exclude_from_totals, 0) = 0""",
         params,
     ).fetchone()
     fixed = float(cur_row["fixed"] or 0)
@@ -4376,12 +4378,12 @@ def _build_fixed_vs_variable(conn, period):
                    COALESCE(SUM(CASE WHEN COALESCE(tp.is_fixed, 0) = 1
                                      THEN t.amount ELSE 0 END), 0) AS fixed,
                    COALESCE(SUM(t.amount), 0) AS total
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE substr(t.date, 1, 7) IN ({placeholders})
               AND t.direction = 'Debit'
-              AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+              AND COALESCE(tp.exclude_from_totals, 0) = 0
             GROUP BY substr(t.date, 1, 7)""",
         months,
     ).fetchall()
@@ -4419,12 +4421,11 @@ def _build_income_breakdown(conn, period):
         f"""SELECT t.amount, t.code, t.counterparty, c.name AS category_name,
                    COALESCE(c.is_primary_salary, 0) AS is_salary,
                    COALESCE(tp.exclude_from_totals, 0) AS excluded
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
-              AND t.direction = 'Credit'
-              AND COALESCE(t.is_matched, 0) = 0""",
+              AND t.direction = 'Credit'""",
         params,
     ).fetchall()
     salary = refunds = other = 0.0
@@ -4475,12 +4476,12 @@ def _build_channel_mix(conn, period):
     placeholders = ",".join("?" * len(months))
     rows = conn.execute(
         f"""SELECT substr(t.date, 1, 7) AS m, t.code, SUM(t.amount) AS total
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE substr(t.date, 1, 7) IN ({placeholders})
               AND t.direction = 'Debit'
-              AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+              AND COALESCE(tp.exclude_from_totals, 0) = 0
             GROUP BY substr(t.date, 1, 7), t.code""",
         months,
     ).fetchall()
@@ -4558,11 +4559,10 @@ def _build_category_pie(conn, period, topic_id):
     ).fetchall()
     rows = conn.execute(
         f"""SELECT c.id, c.name, c.color AS manual_color, SUM(t.amount) AS amount
-            FROM transactions t
+            FROM tx_effective t
             JOIN categories c ON c.id = t.category_id
             WHERE c.topic_id = ? AND {where_sql}
               AND t.direction = 'Debit'
-              AND COALESCE(t.is_matched, 0) = 0
             GROUP BY c.id ORDER BY amount DESC""",
         [topic_id, *params],
     ).fetchall()
@@ -4606,11 +4606,10 @@ def _build_subscription_bloat(conn, period):
         cat_rows = conn.execute(
             f"""SELECT c.id, c.name, SUM(t.amount) AS spent,
                        MIN(t.date) AS first_seen
-                FROM transactions t
+                FROM tx_effective t
                 JOIN categories c ON c.id = t.category_id
                 WHERE c.topic_id = ? AND {where_sql}
                   AND t.direction = 'Debit'
-                  AND COALESCE(t.is_matched, 0) = 0
                 GROUP BY c.id""",
             [tp["id"], *params],
         ).fetchall()
@@ -4622,13 +4621,12 @@ def _build_subscription_bloat(conn, period):
         prior_end = period["start"]
         prior_row = conn.execute(
             """SELECT COALESCE(SUM(t.amount), 0) AS spent
-               FROM transactions t
+               FROM tx_effective t
                JOIN categories c ON c.id = t.category_id
                WHERE c.topic_id = ?
                  AND t.date < ?
                  AND t.date >= date(?, '-6 months')
-                 AND t.direction = 'Debit'
-                 AND COALESCE(t.is_matched, 0) = 0""",
+                 AND t.direction = 'Debit'""",
             (tp["id"], prior_end, prior_start),
         ).fetchone()
         prior_total = float(prior_row["spent"] or 0)
@@ -4715,13 +4713,12 @@ def _build_topic_trends(conn, period):
         f"""SELECT substr(t.date, 1, 7) AS m,
                    tp.id AS topic_id, tp.name AS topic_name, tp.color AS color,
                    SUM(t.amount) AS spent
-            FROM transactions t
+            FROM tx_effective t
             JOIN categories c ON c.id = t.category_id
             JOIN topics tp ON tp.id = c.topic_id
             WHERE substr(t.date, 1, 7) IN ({placeholders})
               AND t.direction = 'Debit'
               AND COALESCE(tp.exclude_from_totals, 0) = 0
-              AND COALESCE(t.is_matched, 0) = 0
             GROUP BY substr(t.date, 1, 7), tp.id
             ORDER BY tp.name, m""",
         months,
@@ -4778,11 +4775,10 @@ def _build_diagnostics(conn, period, balance_account=None):
                    COALESCE(c.is_primary_salary, 0) AS is_salary,
                    COALESCE(tp.exclude_from_totals, 0) AS excluded,
                    COALESCE(tp.is_fixed, 0) AS is_fixed
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
-              AND COALESCE(t.is_matched, 0) = 0
             ORDER BY t.date""",
         params,
     ).fetchall()
@@ -4860,11 +4856,11 @@ def _build_diagnostics(conn, period, balance_account=None):
     placeholders = ",".join("?" * len(months_window))
     series_rows = conn.execute(
         f"""SELECT substr(t.date, 1, 7) AS m, t.direction, SUM(t.amount) AS total
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE substr(t.date, 1, 7) IN ({placeholders})
-              AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+              AND COALESCE(tp.exclude_from_totals, 0) = 0
             GROUP BY substr(t.date, 1, 7), t.direction""",
         months_window,
     ).fetchall()
@@ -4893,12 +4889,12 @@ def _build_diagnostics(conn, period, balance_account=None):
                    COALESCE(tp.name, 'Ongecategoriseerd') AS name,
                    COALESCE(tp.color, '#94a3b8') AS color,
                    SUM(t.amount) AS amount
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
               AND t.direction = 'Debit'
-              AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+              AND COALESCE(tp.exclude_from_totals, 0) = 0
             GROUP BY tp.id ORDER BY amount DESC""",
         params,
     ).fetchall()
@@ -4925,12 +4921,12 @@ def _build_diagnostics(conn, period, balance_account=None):
         f"""SELECT COALESCE(tp.name, 'Ongecategoriseerd') AS name,
                    COALESCE(tp.color, '#94a3b8') AS color,
                    SUM(t.amount) AS spent
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE substr(t.date, 1, 7) IN ({placeholders_prior})
               AND t.direction = 'Debit'
-              AND COALESCE(tp.exclude_from_totals, 0) = 0 AND COALESCE(t.is_matched, 0) = 0
+              AND COALESCE(tp.exclude_from_totals, 0) = 0
             GROUP BY tp.id""",
         prior_months,
     ).fetchall()
@@ -5075,13 +5071,12 @@ def _compute_topic_history(conn, period, months_back=12):
         f"""SELECT substr(t.date, 1, 7) AS m,
                    tp.id AS topic_id, tp.name AS topic_name,
                    SUM(t.amount) AS spent
-            FROM transactions t
+            FROM tx_effective t
             JOIN categories c ON c.id = t.category_id
             JOIN topics tp ON tp.id = c.topic_id
             WHERE substr(t.date, 1, 7) IN ({placeholders})
               AND t.direction = 'Debit'
               AND COALESCE(tp.exclude_from_totals, 0) = 0
-              AND COALESCE(t.is_matched, 0) = 0
             GROUP BY substr(t.date, 1, 7), tp.id""",
         months,
     ).fetchall()
@@ -5117,18 +5112,17 @@ def _compute_savings_rate_history(conn, period, months_back=6):
     placeholders = ",".join("?" * len(months))
     flow_rows = conn.execute(
         f"""SELECT substr(t.date, 1, 7) AS m, t.direction, SUM(t.amount) AS total
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE substr(t.date, 1, 7) IN ({placeholders})
               AND COALESCE(tp.exclude_from_totals, 0) = 0
-              AND COALESCE(t.is_matched, 0) = 0
             GROUP BY substr(t.date, 1, 7), t.direction""",
         months,
     ).fetchall()
     salary_rows = conn.execute(
         f"""SELECT substr(t.date, 1, 7) AS m, SUM(t.amount) AS salary
-            FROM transactions t
+            FROM tx_effective t
             JOIN categories c ON c.id = t.category_id
             WHERE c.is_primary_salary = 1
               AND substr(t.date, 1, 7) IN ({placeholders})
@@ -5189,14 +5183,13 @@ def _compute_recurring_load(conn, period):
     where_sql, params = _period_where_sql(period)
     row = conn.execute(
         f"""SELECT COALESCE(SUM(t.amount), 0) AS total
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
               AND t.direction = 'Debit'
               AND COALESCE(tp.is_fixed, 0) = 1
-              AND COALESCE(tp.exclude_from_totals, 0) = 0
-              AND COALESCE(t.is_matched, 0) = 0""",
+              AND COALESCE(tp.exclude_from_totals, 0) = 0""",
         params,
     ).fetchone()
     fixed_topics = [
@@ -5219,13 +5212,12 @@ def _compute_day_of_period_distribution(conn, period):
     rows = conn.execute(
         f"""SELECT CAST(julianday(t.date) - julianday(?) AS INTEGER) AS d,
                    SUM(t.amount) AS spent
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
               AND t.direction = 'Debit'
               AND COALESCE(tp.exclude_from_totals, 0) = 0
-              AND COALESCE(t.is_matched, 0) = 0
             GROUP BY d""",
         [period["start"], *params],
     ).fetchall()
@@ -5305,13 +5297,12 @@ def _build_ai_summary_payload(conn, period, goal=None):
         f"""SELECT tp.id AS topic_id,
                    COALESCE(c.name, 'Ongecategoriseerd') AS cat_name,
                    SUM(t.amount) AS spent
-            FROM transactions t
+            FROM tx_effective t
             LEFT JOIN categories c ON c.id = t.category_id
             LEFT JOIN topics tp ON tp.id = c.topic_id
             WHERE {where_sql}
               AND t.direction = 'Debit'
               AND COALESCE(tp.exclude_from_totals, 0) = 0
-              AND COALESCE(t.is_matched, 0) = 0
             GROUP BY tp.id, c.id""",
         params,
     ).fetchall()
@@ -6481,13 +6472,12 @@ def api_v1_spending():
             f"""SELECT substr(t.date, 1, 7) AS m,
                        {label_col} AS label,
                        SUM(t.amount) AS spent
-                FROM transactions t
+                FROM tx_effective t
                 LEFT JOIN categories c ON c.id = t.category_id
                 LEFT JOIN topics tp ON tp.id = c.topic_id
                 WHERE substr(t.date, 1, 7) IN ({placeholders})
                   AND t.direction = 'Debit'
                   AND COALESCE(tp.exclude_from_totals, 0) = 0
-                  AND COALESCE(t.is_matched, 0) = 0
                   {topic_clause}
                 GROUP BY m, label""",
             params,
@@ -6652,7 +6642,7 @@ def api_v1_transactions():
             valid_direction=["debit", "credit"],
         )
 
-    where = ["COALESCE(t.is_matched, 0) = 0"]
+    where = []
     params = []
     if q:
         where.append(r"t.name LIKE ? ESCAPE '\'")
@@ -6694,10 +6684,10 @@ def api_v1_transactions():
         rows = conn.execute(
             f"""SELECT t.date, t.name, t.amount, t.direction,
                        tp.name AS topic, c.name AS category
-                FROM transactions t
+                FROM tx_effective t
                 LEFT JOIN categories c ON c.id = t.category_id
                 LEFT JOIN topics tp ON tp.id = c.topic_id
-                WHERE {' AND '.join(where)}
+                {("WHERE " + " AND ".join(where)) if where else ""}
                 ORDER BY t.date DESC, t.id DESC
                 LIMIT ?""",
             params + [limit + 1],
